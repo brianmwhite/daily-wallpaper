@@ -106,13 +106,57 @@ remove_plist_in_users_agents_folder() {
     rm "$PLIST_FILE"
 }
 
+html_unescape() {
+    # First handle numeric entities: &#39;  &#x27;  etc.
+    # Uses awk to convert decimal or hex codes to characters.
+
+    awk '
+    {
+        # Replace numeric decimal entities
+        while (match($0, /&#([0-9]+);/)) {
+            code = substr($0, RSTART+2, RLENGTH-3)
+            chr = sprintf("%c", code)
+            $0 = substr($0, 1, RSTART-1) chr substr($0, RSTART+RLENGTH)
+        }
+
+        # Replace numeric hex entities
+        while (match($0, /&#x[0-9A-Fa-f]+;/)) {
+            hex = substr($0, RSTART+3, RLENGTH-4)
+            code = strtonum("0x" hex)
+            chr = sprintf("%c", code)
+            $0 = substr($0, 1, RSTART-1) chr substr($0, RSTART+RLENGTH)
+        }
+
+        # Replace common named entities
+        gsub(/&amp;/, "&")
+        gsub(/&lt;/, "<")
+        gsub(/&gt;/, ">")
+        gsub(/&quot;/, "\"")
+        gsub(/&apos;/, "\047")
+
+        print
+    }
+    '
+}
+
 show_info_text() {
-    # Parse HPImageArchive API and acquire picture BASE URL
-COPYRIGHT=$(cat "$PICTURE_DIR/info.xml" | \
-    grep -Eo "<copyright>.*<\/copyright>")
-COPYRIGHT=$(echo "$COPYRIGHT" | sed -e "s/<copyright>//")
-COPYRIGHT=$(echo "$COPYRIGHT" | sed -e "s/<\/copyright>//")
-echo $COPYRIGHT
+    local file="$PICTURE_DIR/info.xml"
+
+    local HEADLINE COPYRIGHT
+
+    HEADLINE=$(
+        sed -n 's:.*<headline>\(.*\)</headline>.*:\1:p' "$file"
+    )
+
+    COPYRIGHT=$(
+        sed -n 's:.*<copyright>\(.*\)</copyright>.*:\1:p' "$file"
+    )
+
+    # Decode HTML entities (numeric + common named)
+    HEADLINE=$(printf '%s' "$HEADLINE" | html_unescape)
+    COPYRIGHT=$(printf '%s' "$COPYRIGHT" | html_unescape)
+
+    printf '%s - %s\n' "$HEADLINE" "$COPYRIGHT"
 }
 
 print_message() {
