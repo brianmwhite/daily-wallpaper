@@ -107,54 +107,53 @@ remove_plist_in_users_agents_folder() {
 }
 
 html_unescape() {
-    # First handle numeric entities: &#39;  &#x27;  etc.
-    # Uses awk to convert decimal or hex codes to characters.
+    if command -v python3 >/dev/null 2>&1; then
+        # Prefer Python's robust HTML entity handling
+        python3 -c 'import sys, html; print(html.unescape(sys.stdin.read()), end="")'
+    else
+        # Fallback: awk-based decoder for numeric + common named entities
+        awk '
+        {
+            # Replace numeric decimal entities: &#39;
+            while (match($0, /&#([0-9]+);/)) {
+                code = substr($0, RSTART+2, RLENGTH-3)
+                chr = sprintf("%c", code)
+                $0 = substr($0, 1, RSTART-1) chr substr($0, RSTART+RLENGTH)
+            }
 
-    awk '
-    {
-        # Replace numeric decimal entities
-        while (match($0, /&#([0-9]+);/)) {
-            code = substr($0, RSTART+2, RLENGTH-3)
-            chr = sprintf("%c", code)
-            $0 = substr($0, 1, RSTART-1) chr substr($0, RSTART+RLENGTH)
+            # Replace numeric hex entities: &#x27;
+            while (match($0, /&#x[0-9A-Fa-f]+;/)) {
+                hex = substr($0, RSTART+3, RLENGTH-4)
+                code = strtonum("0x" hex)
+                chr = sprintf("%c", code)
+                $0 = substr($0, 1, RSTART-1) chr substr($0, RSTART+RLENGTH)
+            }
+
+            # Replace common named entities
+            gsub(/&amp;/, "&")
+            gsub(/&lt;/, "<")
+            gsub(/&gt;/, ">")
+            gsub(/&quot;/, "\"")
+            gsub(/&apos;/, "\047")  # apostrophe
+
+            print
         }
-
-        # Replace numeric hex entities
-        while (match($0, /&#x[0-9A-Fa-f]+;/)) {
-            hex = substr($0, RSTART+3, RLENGTH-4)
-            code = strtonum("0x" hex)
-            chr = sprintf("%c", code)
-            $0 = substr($0, 1, RSTART-1) chr substr($0, RSTART+RLENGTH)
-        }
-
-        # Replace common named entities
-        gsub(/&amp;/, "&")
-        gsub(/&lt;/, "<")
-        gsub(/&gt;/, ">")
-        gsub(/&quot;/, "\"")
-        gsub(/&apos;/, "\047")
-
-        print
-    }
-    '
+        '
+    fi
 }
 
 show_info_text() {
     local file="$PICTURE_DIR/info.xml"
-
     local HEADLINE COPYRIGHT
 
+    # Extract inner text from tags
     HEADLINE=$(
-        sed -n 's:.*<headline>\(.*\)</headline>.*:\1:p' "$file"
+        sed -n 's:.*<headline>\(.*\)</headline>.*:\1:p' "$file" | html_unescape
     )
 
     COPYRIGHT=$(
-        sed -n 's:.*<copyright>\(.*\)</copyright>.*:\1:p' "$file"
+        sed -n 's:.*<copyright>\(.*\)</copyright>.*:\1:p' "$file" | html_unescape
     )
-
-    # Decode HTML entities (numeric + common named)
-    HEADLINE=$(printf '%s' "$HEADLINE" | html_unescape)
-    COPYRIGHT=$(printf '%s' "$COPYRIGHT" | html_unescape)
 
     printf '%s - %s\n' "$HEADLINE" "$COPYRIGHT"
 }
