@@ -1,112 +1,83 @@
-# Bash Script for download and set current Bing Daily Wallpaper automatically on all (or selected) monitors for macOS
+# Python CLI to download and set the Bing Daily Wallpaper on macOS
 
 ![alt text](https://raw.githubusercontent.com/lpikora/bing-wallpaper-daily-mac-multimonitor/images/example-bing-animation.gif)
 
-## How it works?
+This project now ships as a Python CLI (managed with [uv](https://docs.astral.sh/uv/)). It downloads the Bing Daily Wallpaper to `~/Pictures/bing-wallpapers/` and sets it across all desktops or a specific monitor on macOS.
 
-Script downloads current Bing Daily Wallpaper to `~/Pictures/bing-wallpapers/` and sets it as wallpaper on all your monitors every day.
+## Requirements
 
-## Set wallpaper (dekstop picture) automatically every day
+- macOS
+- Python 3.9+ and `uv` (`curl -Ls https://astral.sh/uv/install.sh | sh`)
 
-### using `npx`
+## Quick start
 
-1. First install Node.js https://nodejs.org/en/
-2. Run in Terminal `npx --yes bing-wallpaper-daily-mac-multimonitor@latest enable-auto-update`
+- Run once without installing:
 
-### using `bing-wallpaper.sh`
+  ```sh
+  uvx bing-wallpaper-daily-mac-multimonitor
+  ```
 
-1. copy `bing-wallpaper.sh` to your computer eg. your to `~/Desktop` folder
-2. open Terminal app
-3. run `cd ~/Desktop`
-4. run `chmod +x bing-wallpaper.sh` 
-5. run `./bing-wallpaper.sh enable-auto-update`
+- Install as a reusable tool (puts the CLI on your PATH):
 
-**Note:** do not remove `bing-wallpaper.sh` file from your computer. It is needed to download and set wallpaper every day
+  ```sh
+  uv tool install bing-wallpaper-daily-mac-multimonitor
+  bing-wallpaper-daily-mac-multimonitor
+  ```
 
-**Tips:**
-- provide parameter `-d <number>` to set wallpaper from different day eg. 1 for yesterday
-- provide parameter `-c <country-code>` to get country specific Bing picture of the day. Use code like `en-US`, `cs-CZ`.
-- provide parameter `-m <monitor number>` to set wallpaper only on certain monitor
-- provide `--auto-update-name <name>` to have multiple auto update scripts running
+## Automatic daily updates (launchd)
 
-See all parameters providing parameter `--help`
+Create a LaunchAgent that refreshes the wallpaper every 30 minutes (run at load enabled):
 
-## Script Parameters
+```sh
+bing-wallpaper-daily-mac-multimonitor enable-auto-update [options]
+```
 
+Use `--auto-update-name <name>` to keep multiple schedules (one plist per name). Disable a job with:
+
+```sh
+bing-wallpaper-daily-mac-multimonitor disable-auto-update --auto-update-name <name>
+```
+
+Tip: install the tool (`uv tool install ...`) before enabling auto updates so launchd has a stable binary to call.
+
+## Show wallpaper info
+
+After a download has run, display the Bing headline + copyright for the saved wallpaper:
+
+```sh
+bing-wallpaper-daily-mac-multimonitor info
+```
+
+## CLI options
 
 ```
-  enable-auto-update             Enable automatic update of wallpapers every day
-                                 the picture if the filename already exists.
-  disable-auto-update            Disable automatic update of wallpapers every day
-                                 the picture if the filename already exists.
-  info                           Show description of current wallpaper.
-  --auto-update-name <name>      Name of your auto update when enabling/disabling
-                                 Using custom name enables setting multiple automatic update configurations.
-                                 Eg. Set on monitor 1 todays wallpaper and on monitor 2 wallpaper from yesterday                                                           
-  -f --force                     Force download of picture. This will overwrite
-                                 the picture if the filename already exists.
-  -s --ssl                       Communicate with bing.com over SSL.
-  -q --quiet                     Do not display log messages.
-  -c --country <coutry-code>     Specify market country/region eg. en-US, cs-CZ
-                                 Pictures may be different for markets on some days.
-                                 See full list of countries on https://learn.microsoft.com/en-us/previous-versions/bing/search/dd251064(v=msdn.10)
-  -d --day <number>              Day for which you want to get the picture.
-                                 0 is current day, 1 is yesterday etc.
-                                 Default is 0.
-  -n --filename <file name>      The name of the downloaded picture. Defaults to
-                                 the upstream name.
-  -p --picturedir <picture dir>  The full path to the picture download dir.
-                                 Will be created if it does not exist.
-                                 [default: $HOME/Pictures/bing-wallpapers/]
-  -r --resolution <resolution>   The resolution of the image to retrieve.
-                                 Supported resolutions: ${RESOLUTIONS[*]}
-  --resolutions <resolutions>    The resolutions of the image try to retrieve.
-                                 eg.: --resolutions "1920x1200 1920x1080 UHD"
-  -m --monitor <num>             Set wallpaper only on certain monitor (1,2,3...)
-  --all-desktops-experimental    Set wallpaper on all desktops
-                                 Fixing osascript bug when wallpaper is not set for Desktop 2.
-                                 Known issue: Minimized apps are removed from Dock.
-                                 If something goes wrong delete Library/Application Support/Dock/desktoppicture.db
-                                 and restart your Mac.                           
-  -h --help                      Show this screen.
+  enable-auto-update             Write and load a launchd plist for periodic updates.
+  disable-auto-update            Unload and remove the launchd plist.
+  info                           Print the headline and copyright of the last download.
+
+  --auto-update-name <name>      Name for the auto-update job (default: default).
+  -f --force                     Force download even if the file already exists.
+  -s --ssl                       Communicate with bing.com over HTTPS instead of HTTP.
+  -q --quiet                     Suppress log messages.
+  -c --country <country-code>    Market/region code (en-US, cs-CZ, ...).
+  -d --day <number>              Day offset (0=today, 1=yesterday...). Default: 0.
+  -n --filename <file name>      Custom filename for the downloaded picture.
+  -p --picturedir <picture dir>  Download directory [default: ~/Pictures/bing-wallpapers/].
+  -r --resolution <resolution>   Single resolution to try.
+  --resolutions <resolutions>    List of resolutions to try (e.g. --resolutions 1920x1200 UHD).
+  -m --monitor <num>             Apply wallpaper only to a specific monitor (1,2,3...).
+  --all-desktops-experimental    Write directly to desktoppicture.db for all desktops.
+                                 Known issue: minimized apps are removed from Dock.
   --version                      Show version.
+  -h --help                      Show help.
 ```
 
+### Notes and tips
 
-#### How it works?
-
-Command `./bing-wallpaper.sh enable-auto-update` creates a launch agent (plist file in `~/Library/LaunchAgents/`). Agent will run script `bing-wallpaper.sh` every day and automatically update your wallpapers to latest Bing picture of the day.
-
-For More info about launchd see https://www.launchd.info/ Configuration section.
-
-## Set current Bing.com wallpaper manually
-
-### with npm
-
-(How install use script without npm see `Usage (without npm)` below)
-
-1. First install Node.js https://nodejs.org/en/
-
-2. For getting current Bing Daily Wallpaper to your desktop run in terminal:
-
-```
-npx bing-wallpaper-daily-mac-multimonitor
-```
-
-OR
-
-```
-npm -g install bing-wallpaper-daily-mac-multimonitor
-```
-
-then run in terminal
-
-```
-bing-wallpaper-daily-mac-multimonitor
-```
-
-3. For automatic setup of wallpaper every day contine with instructions below
-
-### without npm
-
-Run `./bing-wallpaper.sh` terminal for a single download of current Bing image.
+- Default resolutions are tried in order: `1920x1200`, `1920x1080`, `1024x768`, `1280x720`, `1366x768`, `UHD`.
+- Use `--auto-update-name` to run multiple schedules (different monitors, days, or countries).
+- The experimental `--all-desktops-experimental` flag writes to `~/Library/Application Support/Dock/desktoppicture.db`. If something breaks, delete that file and restart the Dock.
+- Wallpapers and `info.xml` are saved under `~/Pictures/bing-wallpapers/` unless overridden with `--picturedir`.
+- The legacy `bing-wallpaper.sh` remains in the repo for reference, but the Python CLI is the supported entrypoint going forward.
+- The previous npm distribution is no longer required; install/run via `uv` instead.
+- For local development without installing, run `./run.sh ...` (uses `uv run` when available, falls back to `PYTHONPATH=src python -m bing_wallpaper.cli`).
