@@ -77,8 +77,6 @@ bing-wallpaper-daily-mac-multimonitor info
 - Use `--auto-update-name` to run multiple schedules (different monitors, days, or countries).
 - The experimental `--all-desktops-experimental` flag writes to `~/Library/Application Support/Dock/desktoppicture.db`. If something breaks, delete that file and restart the Dock.
 - Wallpapers and `info.xml` are saved under `~/Pictures/bing-wallpapers/` unless overridden with `--picturedir`.
-- The legacy `bing-wallpaper.sh` remains in the repo for reference, but the Python CLI is the supported entrypoint going forward.
-- The previous npm distribution is no longer required; install/run via `uv` instead.
 - For local development without installing, run `./run.sh ...` (uses `uv run --project <repo>` when available, falls back to `PYTHONPATH=src python -m bing_wallpaper.cli`).
 
 ## Development and tests
