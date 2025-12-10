@@ -1,7 +1,5 @@
 # Python CLI to download and set the Bing Daily Wallpaper on macOS
 
-![alt text](https://raw.githubusercontent.com/lpikora/bing-wallpaper-daily-mac-multimonitor/images/example-bing-animation.gif)
-
 This project now ships as a Python CLI (managed with [uv](https://docs.astral.sh/uv/)). It downloads the Bing Daily Wallpaper to `~/Pictures/bing-wallpapers/` and sets it across all desktops or a specific monitor on macOS.
 
 ## Requirements
