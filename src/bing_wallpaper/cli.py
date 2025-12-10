@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
+from urllib.error import HTTPError
 from . import __version__
 
 DEFAULT_RESOLUTIONS: list[str] = [
@@ -170,6 +171,8 @@ def fetch_image_metadata(archive_url: str) -> tuple[str, bytes]:
             if getattr(response, "status", 200) != 200:
                 raise WallpaperError(f"Unexpected status {response.status} from {archive_url}")
             body = response.read()
+    except HTTPError as exc:  # pragma: no cover - network failures need to be surfaced
+        raise WallpaperError(f"Unable to fetch Bing metadata from {archive_url}: HTTP {exc.code}") from exc
     except Exception as exc:  # pragma: no cover - network failures need to be surfaced
         raise WallpaperError(f"Unable to fetch Bing metadata from {archive_url}") from exc
 
@@ -215,43 +218,51 @@ def download_image(
         log(f"Skipping download, already present: {target_path.name}", settings.quiet)
         return target_path, True
 
-    # Clean up previous downloads for the same auto-update name
-    for candidate in settings.picture_dir.glob(f"{settings.auto_update_name}-*.jpg"):
-        candidate.unlink(missing_ok=True)
-
     log(f"Downloading {resolution} from {file_url}", settings.quiet)
+    temp_path = target_path.with_suffix(f"{target_path.suffix}.tmp")
     try:
+        temp_path.unlink(missing_ok=True)
         file_request = urllib.request.Request(file_url, headers={"User-Agent": USER_AGENT})
         with urllib.request.urlopen(file_request, timeout=IMAGE_TIMEOUT) as response:
             if getattr(response, "status", 200) != 200:
                 raise WallpaperError(f"Unexpected status {response.status} when fetching {file_url}")
-            with target_path.open("wb") as handle:
+            with temp_path.open("wb") as handle:
                 handle.write(response.read())
+
+        # Remove previous downloads only after the new one is safely on disk
+        for candidate in settings.picture_dir.glob(f"{settings.auto_update_name}-*.jpg"):
+            if candidate != target_path:
+                candidate.unlink(missing_ok=True)
+
+        temp_path.replace(target_path)
 
         info_path = settings.picture_dir / "info.xml"
         with info_path.open("wb") as handle:
             handle.write(metadata_body)
+    except HTTPError as exc:
+        temp_path.unlink(missing_ok=True)
+        raise WallpaperError(f"Failed to download wallpaper at {resolution}: HTTP {exc.code}") from exc
     except Exception as exc:
         # Clean up partial downloads
-        target_path.unlink(missing_ok=True)
+        temp_path.unlink(missing_ok=True)
         raise WallpaperError(f"Failed to download wallpaper at {resolution}") from exc
 
     return target_path, False
 
 
 def set_wallpaper(file_path: Path, monitor: int, quiet: bool) -> None:
-    escaped_path = str(file_path).replace('"', '\\"')
+    posix_path = file_path.as_posix().replace('"', '\\"')
     if monitor >= 1:
         script = f"""
         set tlst to {{}}
         tell application "System Events"
             set tlst to a reference to every desktop
-            set picture of item {monitor} of tlst to "{escaped_path}"
+            set picture of item {monitor} of tlst to (POSIX file "{posix_path}")
         end tell
         """
     else:
         script = (
-            f'tell application "System Events" to tell every desktop to set picture to "{escaped_path}"'
+            f'tell application "System Events" to tell every desktop to set picture to (POSIX file "{posix_path}")'
         )
 
     log(f"Setting wallpaper to {file_path} (monitor: {'all' if monitor < 1 else monitor})", quiet)
@@ -279,7 +290,10 @@ def set_wallpaper_experimental(file_path: Path, quiet: bool) -> None:
     finally:
         conn.close()
 
-    subprocess.run(["killall", "Dock"], check=False)
+    try:
+        subprocess.run(["killall", "Dock"], check=True)
+    except subprocess.CalledProcessError as exc:
+        raise WallpaperError("Failed to restart Dock after updating wallpaper.") from exc
 
 
 def create_launchd_plist(settings: Settings, rest_args: Sequence[str]) -> None:
@@ -399,6 +413,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
         except WallpaperError as exc:
             last_error = exc
+            log(f"Resolution {res} failed: {exc}", settings.quiet)
             continue
 
         if file_path is None:
