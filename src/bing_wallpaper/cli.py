@@ -28,6 +28,8 @@ LAUNCHD_PATH = Path.home() / "Library" / "LaunchAgents"
 DEFAULT_PATH = "/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin"
 BING_ARCHIVE_URL = "https://www.bing.com/HPImageArchive.aspx"
 USER_AGENT = f"bing-wallpaper-daily-mac-multimonitor/{__version__}"
+METADATA_TIMEOUT = 30
+IMAGE_TIMEOUT = 60
 
 
 class WallpaperError(Exception):
@@ -86,9 +88,16 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument(
         "-f", "--force", action="store_true", help="Force download even if the file already exists."
     )
-    parser.add_argument(
-        "-s", "--ssl", action="store_true", help="Download images over HTTPS instead of HTTP."
+
+    ssl_group = parser.add_mutually_exclusive_group()
+    ssl_group.set_defaults(ssl=True)
+    ssl_group.add_argument(
+        "-s", "--ssl", dest="ssl", action="store_true", help="Download images over HTTPS (default)."
     )
+    ssl_group.add_argument(
+        "--no-ssl", dest="ssl", action="store_false", help="Use HTTP instead of HTTPS."
+    )
+
     parser.add_argument(
         "-q", "--quiet", action="store_true", help="Suppress log messages."
     )
@@ -154,10 +163,12 @@ def build_archive_url(day: int, country: Optional[str]) -> str:
     return f"{BING_ARCHIVE_URL}?{urllib.parse.urlencode(query)}"
 
 
-def fetch_image_url_base(archive_url: str) -> str:
+def fetch_image_metadata(archive_url: str) -> tuple[str, bytes]:
     try:
         request = urllib.request.Request(archive_url, headers={"User-Agent": USER_AGENT})
-        with urllib.request.urlopen(request) as response:
+        with urllib.request.urlopen(request, timeout=METADATA_TIMEOUT) as response:
+            if getattr(response, "status", 200) != 200:
+                raise WallpaperError(f"Unexpected status {response.status} from {archive_url}")
             body = response.read()
     except Exception as exc:  # pragma: no cover - network failures need to be surfaced
         raise WallpaperError(f"Unable to fetch Bing metadata from {archive_url}") from exc
@@ -170,7 +181,7 @@ def fetch_image_url_base(archive_url: str) -> str:
 
     if not url_base:
         raise WallpaperError("Bing response did not include an image URL.")
-    return url_base
+    return url_base, body
 
 
 def sanitize_filename(name: str) -> str:
@@ -188,7 +199,7 @@ def download_image(
     url_base: str,
     resolution: str,
     settings: Settings,
-    archive_url: str,
+    metadata_body: bytes,
 ) -> Tuple[Optional[Path], bool]:
     file_url_with_res = f"{url_base}_{resolution}.jpg"
     file_url = f"{settings.proto}://www.bing.com/{file_url_with_res.lstrip('/')}"
@@ -211,12 +222,15 @@ def download_image(
     log(f"Downloading {resolution} from {file_url}", settings.quiet)
     try:
         file_request = urllib.request.Request(file_url, headers={"User-Agent": USER_AGENT})
-        with urllib.request.urlopen(file_request) as response, target_path.open("wb") as handle:
-            handle.write(response.read())
+        with urllib.request.urlopen(file_request, timeout=IMAGE_TIMEOUT) as response:
+            if getattr(response, "status", 200) != 200:
+                raise WallpaperError(f"Unexpected status {response.status} when fetching {file_url}")
+            with target_path.open("wb") as handle:
+                handle.write(response.read())
+
         info_path = settings.picture_dir / "info.xml"
-        info_request = urllib.request.Request(archive_url, headers={"User-Agent": USER_AGENT})
-        with urllib.request.urlopen(info_request) as response, info_path.open("wb") as handle:
-            handle.write(response.read())
+        with info_path.open("wb") as handle:
+            handle.write(metadata_body)
     except Exception as exc:
         # Clean up partial downloads
         target_path.unlink(missing_ok=True)
@@ -357,8 +371,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         filename=args.filename,
     )
 
-    archive_url = build_archive_url(settings.day, settings.country)
-
     if args.command == "enable-auto-update":
         create_launchd_plist(settings, raw_args)
         log("Automatic wallpaper update enabled.", settings.quiet)
@@ -373,7 +385,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     ensure_picture_dir(settings.picture_dir)
 
-    url_base = fetch_image_url_base(archive_url)
+    archive_url = build_archive_url(settings.day, settings.country)
+    url_base, metadata_body = fetch_image_metadata(archive_url)
+
     last_error: Optional[Exception] = None
     for res in resolutions:
         try:
@@ -381,7 +395,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 url_base=url_base,
                 resolution=res,
                 settings=settings,
-                archive_url=archive_url,
+                metadata_body=metadata_body,
             )
         except WallpaperError as exc:
             last_error = exc
