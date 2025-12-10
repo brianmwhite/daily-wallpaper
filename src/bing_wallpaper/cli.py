@@ -37,6 +37,17 @@ class WallpaperError(Exception):
     """Raised when the wallpaper workflow fails."""
 
 
+def _close_http_error(exc: HTTPError) -> None:
+    """Best-effort close on HTTPError to avoid leaked resources."""
+    try:
+        if exc.fp:
+            exc.fp.close()
+    finally:
+        close = getattr(exc, "close", None)
+        if callable(close):
+            close()
+
+
 @dataclass(slots=True)
 class Settings:
     proto: str
@@ -172,6 +183,7 @@ def fetch_image_metadata(archive_url: str) -> tuple[str, bytes]:
                 raise WallpaperError(f"Unexpected status {response.status} from {archive_url}")
             body = response.read()
     except HTTPError as exc:  # pragma: no cover - network failures need to be surfaced
+        _close_http_error(exc)
         raise WallpaperError(f"Unable to fetch Bing metadata from {archive_url}: HTTP {exc.code}") from exc
     except Exception as exc:  # pragma: no cover - network failures need to be surfaced
         raise WallpaperError(f"Unable to fetch Bing metadata from {archive_url}") from exc
@@ -240,6 +252,7 @@ def download_image(
         with info_path.open("wb") as handle:
             handle.write(metadata_body)
     except HTTPError as exc:
+        _close_http_error(exc)
         temp_path.unlink(missing_ok=True)
         raise WallpaperError(f"Failed to download wallpaper at {resolution}: HTTP {exc.code}") from exc
     except Exception as exc:
