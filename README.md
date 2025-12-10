@@ -57,7 +57,8 @@ bing-wallpaper-daily-mac-multimonitor info
 
   --auto-update-name <name>      Name for the auto-update job (default: default).
   -f --force                     Force download even if the file already exists.
-  -s --ssl                       Communicate with bing.com over HTTPS instead of HTTP.
+  -s --ssl                       Communicate with bing.com over HTTPS (default; use --no-ssl to opt out).
+  --no-ssl                       Communicate with bing.com over HTTP (not recommended).
   -q --quiet                     Suppress log messages.
   -c --country <country-code>    Market/region code (en-US, cs-CZ, ...).
   -d --day <number>              Day offset (0=today, 1=yesterday...). Default: 0.
@@ -80,4 +81,18 @@ bing-wallpaper-daily-mac-multimonitor info
 - Wallpapers and `info.xml` are saved under `~/Pictures/bing-wallpapers/` unless overridden with `--picturedir`.
 - The legacy `bing-wallpaper.sh` remains in the repo for reference, but the Python CLI is the supported entrypoint going forward.
 - The previous npm distribution is no longer required; install/run via `uv` instead.
-- For local development without installing, run `./run.sh ...` (uses `uv run` when available, falls back to `PYTHONPATH=src python -m bing_wallpaper.cli`).
+- For local development without installing, run `./run.sh ...` (uses `uv run --package <repo>` when available, falls back to `PYTHONPATH=src python -m bing_wallpaper.cli`).
+
+## Development and tests
+
+- Run the test suite with uv (uses an isolated env):
+
+  ```sh
+  UV_CACHE_DIR=/tmp/uv-cache uv run python -m unittest tests/test_cli.py
+  ```
+
+- Or run with system Python from the repo root:
+
+  ```sh
+  PYTHONPATH=src python -m unittest tests/test_cli.py
+  ```
