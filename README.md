@@ -9,16 +9,18 @@ This project now ships as a Python CLI (managed with [uv](https://docs.astral.sh
 
 ## Quick start
 
-- Run once without installing:
+- Run once from the repo without installing:
 
   ```sh
-  uvx bing-wallpaper-daily-mac-multimonitor
+  ./run.sh [options]
+  # or
+  uv run --project . python -m bing_wallpaper.cli [options]
   ```
 
-- Install as a reusable tool (puts the CLI on your PATH):
+- Install the CLI locally (PATH entry via uv tool):
 
   ```sh
-  uv tool install bing-wallpaper-daily-mac-multimonitor
+  uv tool install --from . bing-wallpaper-daily-mac-multimonitor
   bing-wallpaper-daily-mac-multimonitor
   ```
 
