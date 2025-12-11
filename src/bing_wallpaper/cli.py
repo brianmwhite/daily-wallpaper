@@ -335,12 +335,22 @@ def create_launchd_plist(settings: Settings, rest_args: Sequence[str]) -> None:
 
         plistlib.dump(plist_data, handle)
 
-    subprocess.run(["launchctl", "unload", "-w", str(settings.plist_filename)], check=False)
+    subprocess.run(
+        ["launchctl", "unload", "-w", str(settings.plist_filename)],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
     subprocess.run(["launchctl", "load", "-w", str(settings.plist_filename)], check=True)
 
 
 def remove_launchd_plist(settings: Settings) -> None:
-    subprocess.run(["launchctl", "unload", "-w", str(settings.plist_filename)], check=False)
+    subprocess.run(
+        ["launchctl", "unload", "-w", str(settings.plist_filename)],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
     settings.plist_filename.unlink(missing_ok=True)
 
 
