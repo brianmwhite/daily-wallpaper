@@ -1,2 +1,6 @@
 src/bing_wallpaper/__pycache__
 .DS_Store
+
+# Added by cargo
+
+/target

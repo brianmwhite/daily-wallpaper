@@ -1,11 +1,11 @@
-# Python CLI to download and set the Bing Daily Wallpaper on macOS
+# Rust CLI to download and set the Bing Daily Wallpaper on macOS
 
-This project now ships as a Python CLI (managed with [uv](https://docs.astral.sh/uv/)). It downloads the Bing Daily Wallpaper to `~/Pictures/bing-wallpapers/` and sets it across all desktops or a specific monitor on macOS.
+This project now ships as a Rust CLI. It downloads the Bing Daily Wallpaper to `~/Pictures/bing-wallpapers/` and sets it across all desktops or a specific monitor on macOS.
 
 ## Requirements
 
 - macOS
-- Python 3.9+ and `uv` (`curl -Ls https://astral.sh/uv/install.sh | sh`)
+- Rust toolchain (`rustup` recommended)
 
 ## Quick start
 
@@ -14,13 +14,13 @@ This project now ships as a Python CLI (managed with [uv](https://docs.astral.sh
   ```sh
   ./run.sh [options]
   # or
-  uv run --project . python -m bing_wallpaper.cli [options]
+  cargo run -- [options]
   ```
 
-- Install the CLI locally (PATH entry via uv tool):
+- Install the CLI locally so it is on your `PATH`:
 
   ```sh
-  uv tool install --from . bing-wallpaper-daily-mac-multimonitor
+  cargo install --path .
   bing-wallpaper-daily-mac-multimonitor
   ```
 
@@ -79,18 +79,12 @@ bing-wallpaper-daily-mac-multimonitor info
 - Use `--auto-update-name` to run multiple schedules (different monitors, days, or countries).
 - The experimental `--all-desktops-experimental` flag writes to `~/Library/Application Support/Dock/desktoppicture.db`. If something breaks, delete that file and restart the Dock.
 - Wallpapers and `info.xml` are saved under `~/Pictures/bing-wallpapers/` unless overridden with `--picturedir`.
-- For local development without installing, run `./run.sh ...` (uses `uv run --project <repo>` when available, falls back to `PYTHONPATH=src python -m bing_wallpaper.cli`).
+- For local development without installing, run `./run.sh ...` (calls `cargo run --`).
 
 ## Development and tests
 
-- Run the test suite with uv (uses an isolated env):
+- Run the test suite:
 
   ```sh
-  UV_CACHE_DIR=/tmp/uv-cache uv run python -m unittest tests/test_cli.py
-  ```
-
-- Or run with system Python from the repo root:
-
-  ```sh
-  PYTHONPATH=src python -m unittest tests/test_cli.py
+  cargo test
   ```
