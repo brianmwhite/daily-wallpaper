@@ -100,12 +100,7 @@ pub(crate) fn fetch_apod_candidate(
     fs::create_dir_all(&media_dir)?;
     let file_name = format!("apod_{date_label}.jpg");
     let target_path = media_dir.join(file_name);
-    let download = download_to_path(
-        client,
-        &image_url,
-        &target_path,
-        settings,
-    )?;
+    let download = download_to_path(client, &image_url, &target_path, settings)?;
 
     let candidate = WallpaperCandidate {
         id: candidate_id,

@@ -128,10 +128,7 @@ pub(crate) fn fetch_spotlight_candidates(
     }
 
     let url = build_spotlight_url(settings);
-    log_verbose(
-        &format!("Fetching Spotlight feed: {}", url),
-        settings,
-    );
+    log_verbose(&format!("Fetching Spotlight feed: {}", url), settings);
     let response = client.get(url.clone()).timeout(METADATA_TIMEOUT).send()?;
     ensure_http_success(response.status(), &url)?;
     let body = response.bytes()?.to_vec();
@@ -155,12 +152,7 @@ pub(crate) fn fetch_spotlight_candidates(
         let file_name = format!("spotlight_{date_label}_{ordinal}.jpg");
         let local_path = media_dir.join(file_name);
 
-        let download = download_to_path(
-            client,
-            &asset_url,
-            &local_path,
-            settings,
-        )?;
+        let download = download_to_path(client, &asset_url, &local_path, settings)?;
 
         let candidate_id = format!("spotlight-{date_label}-{ordinal}");
         let candidate = WallpaperCandidate {

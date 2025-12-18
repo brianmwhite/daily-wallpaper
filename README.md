@@ -94,6 +94,44 @@ bing-wallpaper-daily-mac-multimonitor info
 - APOD respects `--day`, skips non-image media, defaults to the NASA DEMO_KEY (supply your own key or set `NASA_API_KEY` to avoid rate limits), and center-crops/resizes to your primary display’s aspect ratio by default (disable with `--no-apod-crop`).
 - `choose` downloads/caches today’s Bing, Spotlight, and APOD candidates (if available), shows a list you can navigate with arrows, lets you preview with Quick Look, refresh, or apply.
 - Use `--prune-cache-days <n>` to delete cached days older than `<n>` after a successful run.
+- Defaults can be set in `~/.wallpaperconfig` (TOML). Example:
+
+  ```toml
+  # Default source when not set on CLI: bing | spotlight | apod
+  default_source = "bing"
+
+  # Target monitor (0 = all)
+  monitor = 0
+
+  # Name for auto-update job and saved files
+  auto_update_name = "default"
+
+  # Prune cache after successful run (days)
+  prune_cache_days = 14
+
+  # Default download directory
+  picture_dir = "~/Pictures/bing-wallpapers"
+
+  # Verbosity: quiet | normal | verbose
+  verbosity = "normal"
+
+  # Spotlight settings
+  spotlight_index = 1
+
+  [bing]
+  country = "en-US"
+  resolutions = ["1920x1200", "1920x1080", "1366x768", "UHD"]
+
+  [apod]
+  api_key = "your-nasa-api-key"
+  crop = true
+  ```
+
+  Notes:
+  - CLI flags and environment variables still override config values.
+  - `api_key` can also be provided as a top-level `apod_api_key = "..."` for backward compatibility.
+  - `resolutions` apply to Bing only; Spotlight ignores them; APOD always downloads full resolution.
+  - `verbosity` sets the default; `--quiet`/`--verbose` still take precedence.
 
 ## Development and tests
 

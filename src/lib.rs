@@ -1,7 +1,7 @@
 use chrono::{Duration as ChronoDuration, Local, NaiveDate};
 use clap::{ArgAction, Parser, ValueEnum};
-use inquire::{InquireError, Select};
 use indicatif::{ProgressBar, ProgressStyle};
+use inquire::{InquireError, Select};
 use plist::{Dictionary, Value};
 use reqwest::blocking::Client;
 use reqwest::StatusCode;
@@ -128,6 +128,24 @@ enum WallpaperSource {
     Apod,
 }
 
+#[derive(Debug, Deserialize, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+enum ConfigSource {
+    Bing,
+    Spotlight,
+    Apod,
+}
+
+impl From<ConfigSource> for SourceArg {
+    fn from(value: ConfigSource) -> Self {
+        match value {
+            ConfigSource::Bing => SourceArg::Bing,
+            ConfigSource::Spotlight => SourceArg::Spotlight,
+            ConfigSource::Apod => SourceArg::Apod,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WallpaperCandidate {
     id: String,
@@ -146,6 +164,50 @@ struct WallpaperCandidate {
 struct CacheIndex {
     date: String,
     candidates: Vec<WallpaperCandidate>,
+}
+
+#[derive(Debug, Default, Deserialize, Clone)]
+struct ApodConfig {
+    #[serde(default)]
+    api_key: Option<String>,
+    #[serde(default)]
+    crop: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize, Clone)]
+struct BingConfig {
+    #[serde(default)]
+    country: Option<String>,
+    #[serde(default)]
+    resolutions: Option<Vec<String>>,
+}
+
+#[derive(Debug, Default, Deserialize, Clone)]
+struct AppConfig {
+    #[serde(default)]
+    default_source: Option<ConfigSource>,
+    #[serde(default)]
+    spotlight_index: Option<usize>,
+    #[serde(default)]
+    monitor: Option<usize>,
+    #[serde(default)]
+    all_desktops_experimental: Option<bool>,
+    #[serde(default)]
+    auto_update_name: Option<String>,
+    #[serde(default)]
+    prune_cache_days: Option<u32>,
+    #[serde(default)]
+    picture_dir: Option<PathBuf>,
+    #[serde(default)]
+    verbosity: Option<String>,
+    #[serde(default)]
+    country: Option<String>,
+    #[serde(default)]
+    resolutions: Option<Vec<String>>,
+    #[serde(default)]
+    apod: Option<ApodConfig>,
+    #[serde(default)]
+    bing: Option<BingConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -374,6 +436,7 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
     let mut clap_args = vec![OsString::from("bing-wallpaper-daily-mac-multimonitor")];
     clap_args.extend(raw_args.iter().map(OsString::from));
     let args = Cli::parse_from(clap_args);
+    let config = load_config();
 
     if args.resolution.is_some() && !args.resolutions.is_empty() {
         return Err(WallpaperError::Message(
@@ -388,16 +451,28 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
     }
 
     let single_resolution = args.resolution.clone();
-    let resolutions: Vec<String> = if let Some(res) = single_resolution {
+    let mut resolutions: Vec<String> = if let Some(res) = single_resolution {
         vec![res]
     } else if !args.resolutions.is_empty() {
         args.resolutions.clone()
+    } else if let Some(cfg) = &config {
+        cfg.bing
+            .as_ref()
+            .and_then(|b| b.resolutions.clone())
+            .or_else(|| cfg.resolutions.clone())
+            .unwrap_or_else(|| DEFAULT_RESOLUTIONS.iter().map(|s| s.to_string()).collect())
     } else {
         DEFAULT_RESOLUTIONS.iter().map(|s| s.to_string()).collect()
     };
 
     let ssl = !args.no_ssl && args.ssl;
-    let source = map_source(args.source);
+    let mut source_arg = args.source;
+    if let Some(cfg) = &config {
+        if let Some(def) = cfg.default_source {
+            source_arg = def.into();
+        }
+    }
+    let source = map_source(source_arg);
     if source != WallpaperSource::Bing
         && (!args.resolutions.is_empty() || args.resolution.is_some())
     {
@@ -414,34 +489,153 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
         );
     }
 
+    let monitor_override = arg_present(&raw_args, &["-m", "--monitor"]);
+    let spotlight_override = arg_present(&raw_args, &["--spotlight-index"]);
+    let auto_update_override =
+        arg_present(&raw_args, &["--auto-update-name", "--auto_update_name"]);
+    let prune_override = arg_present(&raw_args, &["--prune-cache-days"]);
+    let picture_override = arg_present(&raw_args, &["-p", "--picturedir"]);
+    let verbosity_override = args.quiet || args.verbose;
+    let country_override = arg_present(&raw_args, &["-c", "--country"]);
+    let resolution_override = !args.resolutions.is_empty() || args.resolution.is_some();
+    let apod_crop_override =
+        arg_present(&raw_args, &["--no-apod-crop"]) || arg_present(&raw_args, &["--apod-crop"]);
+
+    if let Some(cfg) = &config {
+        if !resolution_override {
+            resolutions = cfg
+                .bing
+                .as_ref()
+                .and_then(|b| b.resolutions.clone())
+                .or_else(|| cfg.resolutions.clone())
+                .unwrap_or(resolutions);
+        }
+    }
+
+    let (monitor, spotlight_index) = {
+        let mut monitor_val = args.monitor;
+        let mut spotlight_val = args.spotlight_index;
+        if let Some(cfg) = &config {
+            if !monitor_override {
+                if let Some(m) = cfg.monitor {
+                    monitor_val = m;
+                }
+            }
+            if !spotlight_override {
+                if let Some(idx) = cfg.spotlight_index {
+                    spotlight_val = idx;
+                }
+            }
+        }
+        (monitor_val, spotlight_val)
+    };
+
+    let mut quiet = args.quiet;
+    let mut verbose = args.verbose;
+    if !verbosity_override {
+        if let Some(cfg) = &config {
+            if let Some(v) = cfg.verbosity.as_deref() {
+                match v.to_lowercase().as_str() {
+                    "quiet" => {
+                        quiet = true;
+                        verbose = false;
+                    }
+                    "verbose" => {
+                        verbose = true;
+                        quiet = false;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let country = if country_override {
+        args.country.clone()
+    } else if let Some(cfg) = &config {
+        cfg.country
+            .clone()
+            .or_else(|| cfg.bing.as_ref().and_then(|b| b.country.clone()))
+    } else {
+        args.country.clone()
+    };
+
+    let apod_crop = if apod_crop_override {
+        args.apod_crop
+    } else if let Some(cfg) = &config {
+        cfg.apod
+            .as_ref()
+            .and_then(|a| a.crop)
+            .unwrap_or(args.apod_crop)
+    } else {
+        args.apod_crop
+    };
+
+    let prune_cache_days = if prune_override {
+        args.prune_cache_days
+    } else if let Some(cfg) = &config {
+        cfg.prune_cache_days.or(args.prune_cache_days)
+    } else {
+        args.prune_cache_days
+    };
+
+    let picture_dir = if picture_override {
+        args.picture_dir.clone()
+    } else if let Some(cfg) = &config {
+        cfg.picture_dir.clone().or(args.picture_dir.clone())
+    } else {
+        args.picture_dir.clone()
+    };
+
+    let auto_update_name = if auto_update_override {
+        args.auto_update_name.clone()
+    } else if let Some(cfg) = &config {
+        cfg.auto_update_name
+            .clone()
+            .unwrap_or(args.auto_update_name.clone())
+    } else {
+        args.auto_update_name.clone()
+    };
+
+    let experimental = if let Some(cfg) = &config {
+        cfg.all_desktops_experimental
+            .unwrap_or(args.all_desktops_experimental)
+    } else {
+        args.all_desktops_experimental
+    };
+
     let settings = Settings {
         proto: if ssl { "https".into() } else { "http".into() },
-        country: args.country.clone(),
+        country,
         day: args.day,
-        picture_dir: args
-            .picture_dir
+        picture_dir: picture_dir
             .unwrap_or_else(default_picture_dir)
             .expand_tilde(),
-        auto_update_name: normalize_auto_update_name(&args.auto_update_name),
-        monitor: args.monitor,
+        auto_update_name: normalize_auto_update_name(&auto_update_name),
+        monitor,
         force: args.force,
-        verbose: args.verbose,
-        quiet: args.quiet,
-        experimental: args.all_desktops_experimental,
+        verbose,
+        quiet,
+        experimental,
         filename: args.filename.clone(),
         bing_host: "www.bing.com".to_string(),
         source,
-        spotlight_index: args.spotlight_index,
+        spotlight_index,
         spotlight_url_override: None,
         apod_api_key: args
             .apod_api_key
             .clone()
-            .or_else(load_apod_api_key_from_config)
+            .or_else(|| {
+                config
+                    .as_ref()
+                    .and_then(|c| c.apod.as_ref().and_then(|a| a.api_key.clone()))
+            })
+            .or_else(|| load_apod_api_key_from_config())
             .or_else(|| env::var("NASA_API_KEY").ok())
             .unwrap_or_else(|| APOD_DEFAULT_KEY.to_string()),
         apod_url_override: None,
-        apod_crop: args.apod_crop,
-        prune_cache_days: args.prune_cache_days,
+        apod_crop,
+        prune_cache_days,
     };
 
     let cache = CacheManager::new(&settings.picture_dir);
@@ -512,6 +706,17 @@ fn home_dir() -> PathBuf {
     env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn arg_present(args: &[String], flags: &[&str]) -> bool {
+    for arg in args {
+        for flag in flags {
+            if arg == flag || arg.starts_with(&format!("{flag}=")) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn launchd_dir() -> PathBuf {
@@ -1213,28 +1418,27 @@ pub(crate) fn ensure_http_success(status: StatusCode, url: &str) -> Result<()> {
 }
 
 fn load_apod_api_key_from_config() -> Option<String> {
+    load_config().and_then(|cfg| {
+        cfg.apod
+            .as_ref()
+            .and_then(|a| a.api_key.clone())
+            .or_else(|| {
+                // Backward compatibility for top-level key.
+                let path = home_dir().join(".wallpaperconfig");
+                let contents = fs::read_to_string(path).ok()?;
+                let parsed: toml::Value = toml::from_str(&contents).ok()?;
+                parsed
+                    .get("apod_api_key")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            })
+    })
+}
+
+fn load_config() -> Option<AppConfig> {
     let path = home_dir().join(".wallpaperconfig");
     let contents = fs::read_to_string(path).ok()?;
-    let parsed: toml::Value = toml::from_str(&contents).ok()?;
-
-    // Accept either top-level `apod_api_key = "..."` or `[apod] api_key = "..."`
-    if let Some(key) = parsed.get("apod_api_key").and_then(|v| v.as_str()) {
-        let trimmed = key.trim();
-        return if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        };
-    }
-    if let Some(apod) = parsed.get("apod").and_then(|v| v.as_table()) {
-        if let Some(key) = apod.get("api_key").and_then(|v| v.as_str()) {
-            let trimmed = key.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
-        }
-    }
-    None
+    toml::from_str(&contents).ok()
 }
 
 fn run_checked(program: &str, args: &[&str], what: &'static str) -> Result<Output> {
