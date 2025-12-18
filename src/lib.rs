@@ -31,12 +31,12 @@ const DEFAULT_RESOLUTIONS: &[&str] = &[
 ];
 const DEFAULT_PATH: &str = "/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin";
 const USER_AGENT: &str = concat!(
-    "wallpaper-daily-mac-multimonitor/",
+    "daily-wallpaper/",
     env!("CARGO_PKG_VERSION")
 );
 const METADATA_TIMEOUT: Duration = Duration::from_secs(30);
 const IMAGE_TIMEOUT: Duration = Duration::from_secs(60);
-const PLIST_BASENAME: &str = "com.thirdember.wallpaper-daily-mac-multimonitor";
+const PLIST_BASENAME: &str = "com.thirdember.daily-wallpaper";
 const CACHE_DIR_NAME: &str = "cache";
 const CACHE_INDEX_FILE: &str = "index.json";
 const LAST_APPLIED_FILE: &str = "last_applied.json";
@@ -347,7 +347,7 @@ fn map_source(source: SourceArg) -> WallpaperSource {
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "wallpaper-daily-mac-multimonitor",
+    name = "daily-wallpaper",
     version,
     about = "Download the daily wallpapers and apply one to macOS desktops."
 )]
@@ -432,7 +432,7 @@ pub fn run_from_env() -> Result<()> {
 }
 
 fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
-    let mut clap_args = vec![OsString::from("wallpaper-daily-mac-multimonitor")];
+    let mut clap_args = vec![OsString::from("daily-wallpaper")];
     clap_args.extend(raw_args.iter().map(OsString::from));
     let args = Cli::parse_from(clap_args);
     let config = load_config();

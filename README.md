@@ -1,4 +1,4 @@
-# Bing Wallpaper Daily for macOS (multi-monitor)
+# Daily Wallpaper for macOS (multi-monitor)
 
 Rust CLI that downloads Bing/Spotlight/NASA APOD wallpapers to `~/Pictures/daily-wallpapers/` and applies them across all desktops or a specific monitor on macOS.
 
@@ -19,7 +19,7 @@ Install the CLI on your `PATH`:
 
 ```sh
 cargo install --path .
-bing-wallpaper-daily-mac-multimonitor
+daily-wallpaper
 ```
 
 ## Quick start
@@ -35,7 +35,7 @@ bing-wallpaper-daily-mac-multimonitor
 - After installing, just call the binary:
 
   ```sh
-  bing-wallpaper-daily-mac-multimonitor [options]
+  daily-wallpaper [options]
   ```
 
 ## Usage
@@ -43,19 +43,19 @@ bing-wallpaper-daily-mac-multimonitor
 - Download today’s Bing wallpaper to the default directory and apply to all desktops (default behavior):
 
   ```sh
-  bing-wallpaper-daily-mac-multimonitor
+  daily-wallpaper
   ```
 
 - Apply to a specific monitor (e.g., second display):
 
   ```sh
-  bing-wallpaper-daily-mac-multimonitor --monitor 2
+  daily-wallpaper --monitor 2
   ```
 
 - Choose interactively between Bing, Spotlight, and APOD for today (Quick Look previews):
 
   ```sh
-  bing-wallpaper-daily-mac-multimonitor choose
+  daily-wallpaper choose
   ```
 
 Wallpapers and `info.xml` land in `~/Pictures/daily-wallpapers/` unless you override with `--picturedir`.
@@ -65,13 +65,13 @@ Wallpapers and `info.xml` land in `~/Pictures/daily-wallpapers/` unless you over
 Create a LaunchAgent that refreshes every 30 minutes (runs at load):
 
 ```sh
-bing-wallpaper-daily-mac-multimonitor enable-auto-update [options]
+daily-wallpaper enable-auto-update [options]
 ```
 
 Use `--auto-update-name <name>` to keep multiple schedules (one plist per name). Disable a job with:
 
 ```sh
-bing-wallpaper-daily-mac-multimonitor disable-auto-update --auto-update-name <name>
+daily-wallpaper disable-auto-update --auto-update-name <name>
 ```
 
 Tip: install first (`cargo install --path .`) so `launchd` references a stable binary path.
@@ -81,7 +81,7 @@ Tip: install first (`cargo install --path .`) so `launchd` references a stable b
 After a download, display the Bing headline and copyright for the saved wallpaper:
 
 ```sh
-bing-wallpaper-daily-mac-multimonitor info
+daily-wallpaper info
 ```
 
 ## Configuration (`~/.wallpaperconfig`)
@@ -188,4 +188,6 @@ cargo test
 ## Future ideas / TODOs
 - Test auto-apply flows.
 
-Project originally forked from https://github.com/lpikora/bing-wallpaper-daily-mac-multimonitor
+## Authors / credits
+- Original project [bing-wallpaper-daily-mac-multimonitor](https://github.com/lpikora/bing-wallpaper-daily-mac-multimonitor) by Lukas Pikora
+- Forked and converted to a rust based CLI with an interactive CLI and additional wallpaper sources by Brian White
