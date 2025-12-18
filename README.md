@@ -2,9 +2,13 @@
 
 ## About
 
-- This project originated as a fork of [bing-wallpaper-daily-mac-multimonitor](https://github.com/lpikora/bing-wallpaper-daily-mac-multimonitor) by Lukas Pikora, but has since been fully rewritten in Rust and expanded to support multiple wallpaper sources.
-- Rust CLI that downloads Bing/Spotlight/NASA APOD wallpapers to `~/Pictures/daily-wallpapers/` and applies them across all desktops or a specific monitor on macOS.
-
+- A Rust-based CLI that downloads Bing, Windows Spotlight, and NASA APOD wallpapers to `~/Pictures/daily-wallpapers/`, with support for applying them across all desktops or to a specific monitor on macOS.
+- This project originated as a fork of
+  [bing-wallpaper-daily-mac-multimonitor](https://github.com/lpikora/bing-wallpaper-daily-mac-multimonitor)
+  by Lukas Pikora, but has since been fully rewritten in Rust and expanded to support multiple wallpaper sources.
+- Windows Spotlight API details were informed by the
+  [Spotlight-Downloader Public](https://github.com/ORelio/Spotlight-Downloader)
+  project.
 - Multi-monitor aware with per-monitor targeting or all desktops
 - Sources: Bing Daily (default), Windows Spotlight (3 per day via `--spotlight-index`), NASA APOD (images only, optional HD, optional crop)
 - Interactive chooser with Quick Look previews
