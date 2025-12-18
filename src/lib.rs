@@ -27,6 +27,7 @@ const DEFAULT_RESOLUTIONS: &[&str] = &[
 const DEFAULT_PATH: &str = "/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin";
 const BING_ARCHIVE_URL: &str = "https://www.bing.com/HPImageArchive.aspx";
 const SPOTLIGHT_URL: &str = "https://fd.api.iris.microsoft.com/v4/api/selection";
+const APOD_URL: &str = "https://api.nasa.gov/planetary/apod";
 const USER_AGENT: &str = concat!(
     "bing-wallpaper-daily-mac-multimonitor/",
     env!("CARGO_PKG_VERSION")
@@ -40,6 +41,7 @@ const LAST_APPLIED_FILE: &str = "last_applied.json";
 const SPOTLIGHT_DEFAULT_COUNTRY: &str = "US";
 const SPOTLIGHT_DEFAULT_LOCALE: &str = "en-US";
 const SPOTLIGHT_COUNT: usize = 3;
+const APOD_DEFAULT_KEY: &str = "DEMO_KEY";
 
 fn source_dir_name(source: WallpaperSource) -> &'static str {
     match source {
@@ -103,6 +105,9 @@ struct Settings {
     source: WallpaperSource,
     spotlight_index: usize,
     spotlight_url_override: Option<String>,
+    apod_api_key: String,
+    apod_hd: bool,
+    apod_url_override: Option<String>,
 }
 
 impl Settings {
@@ -303,6 +308,12 @@ struct Cli {
     )]
     spotlight_index: usize,
 
+    #[arg(long = "nasa-api-key")]
+    apod_api_key: Option<String>,
+
+    #[arg(long = "apod-hd", action = ArgAction::SetTrue)]
+    apod_hd: bool,
+
     #[arg(short = 's', long = "ssl", default_value_t = true, action = ArgAction::SetTrue)]
     ssl: bool,
 
@@ -404,6 +415,13 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
         source,
         spotlight_index: args.spotlight_index,
         spotlight_url_override: None,
+        apod_api_key: args
+            .apod_api_key
+            .clone()
+            .or_else(|| env::var("NASA_API_KEY").ok())
+            .unwrap_or_else(|| APOD_DEFAULT_KEY.to_string()),
+        apod_hd: args.apod_hd,
+        apod_url_override: None,
     };
 
     let cache = CacheManager::new(&settings.picture_dir);
@@ -444,9 +462,7 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
     match settings.source {
         WallpaperSource::Bing => run_bing(&client, &cache, &settings, &date_label, resolutions),
         WallpaperSource::Spotlight => run_spotlight(&client, &cache, &settings, &date_label),
-        WallpaperSource::Apod => Err(WallpaperError::Message(
-            "APOD source not implemented yet. Use --source bing or --source spotlight.".to_string(),
-        )),
+        WallpaperSource::Apod => run_apod(&client, &cache, &settings, &date_label),
     }
 }
 
@@ -970,6 +986,22 @@ struct SpotlightImage {
     asset: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct ApodResponse {
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    hdurl: Option<String>,
+    #[serde(default, rename = "media_type")]
+    media_type: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    explanation: Option<String>,
+    #[serde(default)]
+    copyright: Option<String>,
+}
+
 fn run_spotlight(
     client: &Client,
     cache: &CacheManager,
@@ -1117,6 +1149,101 @@ fn strip_edge_scheme(url: &str) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+fn run_apod(
+    client: &Client,
+    cache: &CacheManager,
+    settings: &Settings,
+    date_label: &str,
+) -> Result<()> {
+    let candidate_id = format!("apod-{date_label}");
+    if !settings.force {
+        if let Some(candidate) = cache.find_candidate_by_id(date_label, &candidate_id)? {
+            if candidate.local_path.exists() {
+                log(
+                    &format!("Using cached APOD wallpaper for {}", date_label),
+                    settings.quiet,
+                );
+                return apply_wallpaper(
+                    &candidate.local_path,
+                    settings,
+                    cache,
+                    &candidate.id,
+                    candidate.source,
+                );
+            }
+        }
+    }
+
+    let apod = fetch_apod(client, settings, date_label)?;
+    if apod.media_type != "image" {
+        return Err(WallpaperError::Message(
+            "APOD media type is not an image; skipping.".to_string(),
+        ));
+    }
+    let image_url = if settings.apod_hd {
+        apod.hdurl.clone().unwrap_or(apod.url.clone())
+    } else {
+        apod.url.clone()
+    };
+    if image_url.is_empty() {
+        return Err(WallpaperError::Message(
+            "APOD response missing image URL.".to_string(),
+        ));
+    }
+
+    let media_dir = cache.media_dir(date_label, WallpaperSource::Apod);
+    fs::create_dir_all(&media_dir)?;
+    let file_name = format!("apod_{date_label}.jpg");
+    let target_path = media_dir.join(file_name);
+    let download = download_to_path(
+        client,
+        &image_url,
+        &target_path,
+        settings.force,
+        settings.quiet,
+    )?;
+
+    let candidate = WallpaperCandidate {
+        id: candidate_id,
+        source: WallpaperSource::Apod,
+        title: apod.title.clone(),
+        description: apod.explanation.clone(),
+        attribution: apod.copyright.clone(),
+        info_url: None,
+        image_url,
+        local_path: download.path,
+        date: date_label.to_string(),
+        metadata_xml: None,
+    };
+    cache.upsert_candidate(date_label, candidate.clone())?;
+
+    apply_wallpaper(
+        &candidate.local_path,
+        settings,
+        cache,
+        &candidate.id,
+        candidate.source,
+    )
+}
+
+fn fetch_apod(client: &Client, settings: &Settings, date_label: &str) -> Result<ApodResponse> {
+    let mut serializer = form_urlencoded::Serializer::new(String::new());
+    serializer.append_pair("api_key", &settings.apod_api_key);
+    serializer.append_pair("date", date_label);
+    let base = settings.apod_url_override.as_deref().unwrap_or(APOD_URL);
+    let url = format!("{base}?{}", serializer.finish());
+    let response = client.get(&url).timeout(METADATA_TIMEOUT).send()?;
+    if response.status() != StatusCode::OK {
+        return Err(WallpaperError::Status {
+            url,
+            status: response.status().as_u16(),
+        });
+    }
+    let body = response.bytes()?.to_vec();
+    let parsed: ApodResponse = serde_json::from_slice(&body)?;
+    Ok(parsed)
 }
 
 fn apply_wallpaper(
@@ -1400,6 +1527,9 @@ mod tests {
             source: WallpaperSource::Bing,
             spotlight_index: 1,
             spotlight_url_override: None,
+            apod_api_key: "TEST".into(),
+            apod_hd: false,
+            apod_url_override: None,
         }
     }
 
@@ -1598,6 +1728,86 @@ mod tests {
         assert_eq!(img1_mock.hits(), 1);
         assert_eq!(img2_mock.hits(), 1);
         assert_eq!(img3_mock.hits(), 1);
+    }
+
+    #[test]
+    fn apod_downloads_and_uses_cache() {
+        let server = MockServer::start();
+        let api_url = server.url("/apod");
+        let img_url = server.url("/image.jpg");
+
+        let api_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/apod")
+                .query_param("api_key", "TEST")
+                .query_param("date", "2024-01-01");
+            then.status(200).body(
+                r#"{
+                "url":"IMAGE_URL",
+                "media_type":"image",
+                "title":"Nebula",
+                "explanation":"desc"
+            }"#
+                .replace("IMAGE_URL", &img_url),
+            );
+        });
+        let img_mock = server.mock(|when, then| {
+            when.method(GET).path("/image.jpg");
+            then.status(200).body("img-bytes");
+        });
+
+        let tmpdir = tempdir().unwrap();
+        let mut settings = make_settings(tmpdir.path(), None, false);
+        settings.source = WallpaperSource::Apod;
+        settings.apod_api_key = "TEST".into();
+        settings.apod_url_override = Some(api_url);
+
+        let cache = CacheManager::new(tmpdir.path());
+        let client = build_client().unwrap();
+        let date_label = "2024-01-01";
+
+        run_apod(&client, &cache, &settings, date_label).unwrap();
+        assert_eq!(api_mock.hits(), 1);
+        assert_eq!(img_mock.hits(), 1);
+
+        // second run should reuse cache
+        run_apod(&client, &cache, &settings, date_label).unwrap();
+        assert_eq!(api_mock.hits(), 1);
+        assert_eq!(img_mock.hits(), 1);
+    }
+
+    #[test]
+    fn apod_errors_on_video() {
+        let server = MockServer::start();
+        let api_url = server.url("/apod");
+        let api_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/apod")
+                .query_param("api_key", "TEST")
+                .query_param("date", "2024-01-02");
+            then.status(200).body(
+                r#"{
+                "url":"https://example.com/video.mp4",
+                "media_type":"video",
+                "title":"vid"
+            }"#,
+            );
+        });
+
+        let tmpdir = tempdir().unwrap();
+        let mut settings = make_settings(tmpdir.path(), None, false);
+        settings.source = WallpaperSource::Apod;
+        settings.apod_api_key = "TEST".into();
+        settings.apod_url_override = Some(api_url);
+
+        let cache = CacheManager::new(tmpdir.path());
+        let client = build_client().unwrap();
+        let date_label = "2024-01-02";
+
+        let err = run_apod(&client, &cache, &settings, date_label).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("not an image"));
+        assert_eq!(api_mock.hits(), 1);
     }
 
     #[test]

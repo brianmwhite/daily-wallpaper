@@ -3,7 +3,7 @@
 This project now ships as a Rust CLI. It downloads wallpapers to `~/Pictures/bing-wallpapers/` and sets them across all desktops or a specific monitor on macOS. Sources supported today:
 - Bing Daily (default)
 - Windows Spotlight (3 images per day; choose with `--spotlight-index`)
-- (APOD planned next)
+- NASA APOD (images only; use `--apod-hd` to prefer the HD URL)
 
 ## Requirements
 
@@ -59,8 +59,10 @@ bing-wallpaper-daily-mac-multimonitor info
   info                           Print the headline and copyright of the last download.
   choose                         (placeholder) will become an interactive picker in a later release.
 
-  --source <bing|spotlight|apod> Wallpaper source (default: bing; apod pending).
+  --source <bing|spotlight|apod> Wallpaper source (default: bing).
   --spotlight-index <1-3>        Which Spotlight image to apply (default: 1).
+  --nasa-api-key <key>           NASA API key for APOD (default: DEMO_KEY or NASA_API_KEY env).
+  --apod-hd                      Prefer the APOD HD image when available.
   --auto-update-name <name>      Name for the auto-update job (default: default).
   -f --force                     Force download even if the file already exists.
   -s --ssl                       Communicate with bing.com over HTTPS (default; use --no-ssl to opt out).
@@ -87,6 +89,7 @@ bing-wallpaper-daily-mac-multimonitor info
 - Wallpapers and `info.xml` are saved under `~/Pictures/bing-wallpapers/` unless overridden with `--picturedir`.
 - For local development without installing, run `./run.sh ...` (calls `cargo run --`).
 - Spotlight ignores `--day` and always fetches the current feed; Bing respects `--day`. Same-day reruns reuse cached files unless `--force` is given.
+- APOD respects `--day`, skips non-image media, and defaults to the NASA DEMO_KEY (supply your own key or set `NASA_API_KEY` to avoid rate limits).
 
 ## Development and tests
 
