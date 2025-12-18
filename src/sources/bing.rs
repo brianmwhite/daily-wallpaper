@@ -1,9 +1,9 @@
 use crate::{
-    ensure_info_file, log, write_bytes_atomic, CacheManager, Result, Settings, WallpaperCandidate,
-    WallpaperError, WallpaperSource, DEFAULT_RESOLUTIONS, IMAGE_TIMEOUT, METADATA_TIMEOUT,
+    ensure_http_success, ensure_info_file, log, write_bytes_atomic, CacheManager, Result, Settings,
+    WallpaperCandidate, WallpaperError, WallpaperSource, DEFAULT_RESOLUTIONS, IMAGE_TIMEOUT,
+    METADATA_TIMEOUT,
 };
 use reqwest::blocking::Client;
-use reqwest::StatusCode;
 use roxmltree;
 use std::ffi::OsStr;
 use std::fs::{self, File};
@@ -155,14 +155,7 @@ pub(crate) fn build_archive_url(day: i32, country: Option<&str>) -> String {
 
 fn fetch_image_metadata(client: &Client, archive_url: &str) -> Result<(String, Vec<u8>)> {
     let response = client.get(archive_url).timeout(METADATA_TIMEOUT).send()?;
-
-    let status = response.status();
-    if status != StatusCode::OK {
-        return Err(WallpaperError::Status {
-            url: archive_url.to_string(),
-            status: status.as_u16(),
-        });
-    }
+    ensure_http_success(response.status(), archive_url)?;
 
     let body = response.bytes()?.to_vec();
     let url_base = parse_xml_text(&body, "urlBase")?.ok_or(WallpaperError::MissingImageUrl)?;
@@ -287,7 +280,7 @@ pub(crate) fn download_image(
             })?;
 
         let status = response.status();
-        if status != StatusCode::OK {
+        if let Err(_err) = ensure_http_success(status, &file_url) {
             return Err(WallpaperError::DownloadStatus {
                 resolution: resolution.to_string(),
                 status: status.as_u16(),

@@ -20,6 +20,7 @@ mod sources;
 use sources::apod::APOD_DEFAULT_KEY;
 use sources::spotlight::SPOTLIGHT_COUNT;
 use sources::{Source, SourceContext, SourceRegistry};
+
 const DEFAULT_RESOLUTIONS: &[&str] = &[
     "1920x1200",
     "1920x1080",
@@ -103,7 +104,6 @@ struct Settings {
     spotlight_index: usize,
     spotlight_url_override: Option<String>,
     apod_api_key: String,
-    apod_hd: bool,
     apod_url_override: Option<String>,
     apod_crop: bool,
     prune_cache_days: Option<u32>,
@@ -310,9 +310,6 @@ struct Cli {
     #[arg(long = "nasa-api-key")]
     apod_api_key: Option<String>,
 
-    #[arg(long = "apod-hd", action = ArgAction::SetTrue)]
-    apod_hd: bool,
-
     #[arg(
         long = "no-apod-crop",
         action = ArgAction::SetFalse,
@@ -432,9 +429,9 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
         apod_api_key: args
             .apod_api_key
             .clone()
+            .or_else(load_apod_api_key_from_config)
             .or_else(|| env::var("NASA_API_KEY").ok())
             .unwrap_or_else(|| APOD_DEFAULT_KEY.to_string()),
-        apod_hd: args.apod_hd,
         apod_url_override: None,
         apod_crop: args.apod_crop,
         prune_cache_days: args.prune_cache_days,
@@ -595,6 +592,8 @@ fn run_choose(
     loop {
         let candidates =
             gather_candidates(client, cache, registry, &current_settings, &current_res)?;
+        // Force should be one-shot in the chooser to avoid repeated re-downloads.
+        current_settings.force = false;
         if candidates.is_empty() {
             return Err(WallpaperError::Message(
                 "No wallpapers available to choose from.".to_string(),
@@ -764,13 +763,7 @@ fn download_to_path(
     let download_result = (|| -> Result<()> {
         let _ = fs::remove_file(&temp_path);
         let mut response = client.get(url).timeout(IMAGE_TIMEOUT).send()?;
-        let status = response.status();
-        if status != StatusCode::OK {
-            return Err(WallpaperError::Status {
-                url: url.to_string(),
-                status: status.as_u16(),
-            });
-        }
+        ensure_http_success(response.status(), url)?;
         let mut file = File::create(&temp_path)?;
         response.copy_to(&mut file)?;
         file.flush()?;
@@ -1101,6 +1094,47 @@ fn ensure_picture_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn ensure_http_success(status: StatusCode, url: &str) -> Result<()> {
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        return Err(WallpaperError::Message(format!(
+            "Rate limited by {} (HTTP 429). Please retry later.",
+            url
+        )));
+    }
+    if status != StatusCode::OK {
+        return Err(WallpaperError::Status {
+            url: url.to_string(),
+            status: status.as_u16(),
+        });
+    }
+    Ok(())
+}
+
+fn load_apod_api_key_from_config() -> Option<String> {
+    let path = home_dir().join(".wallpaperconfig");
+    let contents = fs::read_to_string(path).ok()?;
+    let parsed: toml::Value = toml::from_str(&contents).ok()?;
+
+    // Accept either top-level `apod_api_key = "..."` or `[apod] api_key = "..."`
+    if let Some(key) = parsed.get("apod_api_key").and_then(|v| v.as_str()) {
+        let trimmed = key.trim();
+        return if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        };
+    }
+    if let Some(apod) = parsed.get("apod").and_then(|v| v.as_table()) {
+        if let Some(key) = apod.get("api_key").and_then(|v| v.as_str()) {
+            let trimmed = key.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
 fn run_checked(program: &str, args: &[&str], what: &'static str) -> Result<Output> {
     let output = Command::new(program).args(args).output()?;
     if output.status.success() {
@@ -1149,7 +1183,6 @@ mod tests {
             spotlight_index: 1,
             spotlight_url_override: None,
             apod_api_key: "TEST".into(),
-            apod_hd: false,
             apod_url_override: None,
             apod_crop: true,
             prune_cache_days: None,

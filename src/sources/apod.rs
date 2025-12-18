@@ -1,11 +1,10 @@
 use crate::{
-    download_to_path, log, unique_temp_path, CacheManager, Result, Settings, WallpaperCandidate,
-    WallpaperError, WallpaperSource, METADATA_TIMEOUT,
+    download_to_path, ensure_http_success, log, unique_temp_path, CacheManager, Result, Settings,
+    WallpaperCandidate, WallpaperError, WallpaperSource, METADATA_TIMEOUT,
 };
 use image::imageops::FilterType;
 use image::{GenericImageView, ImageFormat};
 use reqwest::blocking::Client;
-use reqwest::StatusCode;
 use serde::Deserialize;
 use std::fs;
 use std::path::Path;
@@ -88,11 +87,8 @@ pub(crate) fn fetch_apod_candidate(
             "APOD media type is not an image; skipping.".to_string(),
         ));
     }
-    let image_url = if settings.apod_hd {
-        apod.hdurl.clone().unwrap_or(apod.url.clone())
-    } else {
-        apod.url.clone()
-    };
+    // Prefer HD when available to keep full resolution.
+    let image_url = apod.hdurl.clone().unwrap_or(apod.url.clone());
     if image_url.is_empty() {
         return Err(WallpaperError::Message(
             "APOD response missing image URL.".to_string(),
@@ -143,12 +139,7 @@ fn fetch_apod(client: &Client, settings: &Settings, date_label: &str) -> Result<
     let base = settings.apod_url_override.as_deref().unwrap_or(APOD_URL);
     let url = format!("{base}?{}", serializer.finish());
     let response = client.get(&url).timeout(METADATA_TIMEOUT).send()?;
-    if response.status() != StatusCode::OK {
-        return Err(WallpaperError::Status {
-            url,
-            status: response.status().as_u16(),
-        });
-    }
+    ensure_http_success(response.status(), &url)?;
     let body = response.bytes()?.to_vec();
     let parsed: ApodResponse = serde_json::from_slice(&body)?;
     Ok(parsed)
@@ -162,7 +153,22 @@ fn crop_and_resize_apod(path: &Path) -> Result<()> {
         return Ok(());
     }
 
-    let (target_w, target_h) = detect_primary_display_size().unwrap_or((16, 9));
+    let detected = detect_primary_display_size();
+    if detected.is_none() {
+        // No display info: keep original size but ensure RGB + JPEG.
+        let rgb = img.to_rgb8();
+        let temp_path = unique_temp_path(path);
+        rgb.save_with_format(&temp_path, ImageFormat::Jpeg)
+            .map_err(|err| {
+                WallpaperError::Message(format!("Unable to save processed APOD image: {err}"))
+            })?;
+        if let Ok(f) = fs::File::open(&temp_path) {
+            let _ = f.sync_all();
+        }
+        fs::rename(&temp_path, path)?;
+        return Ok(());
+    }
+    let (target_w, target_h) = detected.unwrap();
     let target_aspect = target_w as f32 / target_h as f32;
     let orig_aspect = orig_w as f32 / orig_h as f32;
 
@@ -177,7 +183,7 @@ fn crop_and_resize_apod(path: &Path) -> Result<()> {
     let y0 = (orig_h - crop_h) / 2;
     let cropped = img.crop_imm(x0, y0, crop_w, crop_h);
 
-    let processed: image::DynamicImage = if target_w > 0 && target_h > 0 {
+    let processed: image::DynamicImage = if target_w <= orig_w && target_h <= orig_h {
         image::DynamicImage::ImageRgba8(image::imageops::resize(
             &cropped,
             target_w,
@@ -185,6 +191,7 @@ fn crop_and_resize_apod(path: &Path) -> Result<()> {
             FilterType::Lanczos3,
         ))
     } else {
+        // Avoid upscaling; keep cropped size.
         image::DynamicImage::ImageRgba8(cropped.to_rgba8())
     };
 
@@ -242,13 +249,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("input.png");
 
-        let img: ImageBuffer<Rgba<u8>, Vec<u8>> = ImageBuffer::from_fn(10, 10, |_, _| {
-            Rgba([10, 20, 30, 255])
-        });
+        let img: ImageBuffer<Rgba<u8>, Vec<u8>> =
+            ImageBuffer::from_fn(10, 10, |_, _| Rgba([10, 20, 30, 255]));
         img.save(&path).unwrap();
 
         crop_and_resize_apod(&path).unwrap();
-        let loaded = image::io::Reader::open(&path)
+        let loaded = image::ImageReader::open(&path)
             .unwrap()
             .with_guessed_format()
             .unwrap()
