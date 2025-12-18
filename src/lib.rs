@@ -1,7 +1,5 @@
 use chrono::{Duration as ChronoDuration, Local, NaiveDate};
 use clap::{ArgAction, Parser, ValueEnum};
-use image::imageops::FilterType;
-use image::GenericImageView;
 use inquire::Select;
 use plist::{Dictionary, Value};
 use reqwest::blocking::Client;
@@ -10,16 +8,17 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::env;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
-use url::form_urlencoded;
 
 mod sources;
+use sources::apod::APOD_DEFAULT_KEY;
+use sources::spotlight::SPOTLIGHT_COUNT;
 use sources::{Source, SourceContext, SourceRegistry};
 const DEFAULT_RESOLUTIONS: &[&str] = &[
     "1920x1200",
@@ -30,9 +29,6 @@ const DEFAULT_RESOLUTIONS: &[&str] = &[
     "UHD",
 ];
 const DEFAULT_PATH: &str = "/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin";
-const BING_ARCHIVE_URL: &str = "https://www.bing.com/HPImageArchive.aspx";
-const SPOTLIGHT_URL: &str = "https://fd.api.iris.microsoft.com/v4/api/selection";
-const APOD_URL: &str = "https://api.nasa.gov/planetary/apod";
 const USER_AGENT: &str = concat!(
     "bing-wallpaper-daily-mac-multimonitor/",
     env!("CARGO_PKG_VERSION")
@@ -43,10 +39,6 @@ const PLIST_BASENAME: &str = "com.bing-wallpaper-daily-mac-multimonitor";
 const CACHE_DIR_NAME: &str = "cache";
 const CACHE_INDEX_FILE: &str = "index.json";
 const LAST_APPLIED_FILE: &str = "last_applied.json";
-const SPOTLIGHT_DEFAULT_COUNTRY: &str = "US";
-const SPOTLIGHT_DEFAULT_LOCALE: &str = "en-US";
-const SPOTLIGHT_COUNT: usize = 3;
-const APOD_DEFAULT_KEY: &str = "DEMO_KEY";
 
 fn source_dir_name(source: WallpaperSource) -> &'static str {
     match source {
@@ -590,81 +582,6 @@ fn require_source<'a>(registry: &'a SourceRegistry, id: WallpaperSource) -> Resu
         .ok_or_else(|| WallpaperError::Message(format!("Source {:?} is not registered.", id)))
 }
 
-struct FetchedCandidate {
-    candidate: WallpaperCandidate,
-    skipped_download: bool,
-}
-
-fn fetch_bing_candidate(
-    client: &Client,
-    cache: &CacheManager,
-    settings: &Settings,
-    date_label: &str,
-    resolutions: Vec<String>,
-) -> Result<FetchedCandidate> {
-    if !settings.force {
-        if let Some(candidate) = cache.find_candidate(date_label, WallpaperSource::Bing)? {
-            if candidate.local_path.exists() {
-                log(
-                    &format!(
-                        "Using cached wallpaper for {} from {:?}",
-                        date_label, candidate.source
-                    ),
-                    settings.quiet,
-                );
-                ensure_info_file(&settings.picture_dir, &candidate)?;
-                return Ok(FetchedCandidate {
-                    candidate,
-                    skipped_download: true,
-                });
-            }
-        }
-    }
-
-    let archive_url = build_archive_url(settings.day, settings.country.as_deref());
-    let (url_base, metadata_body) = fetch_image_metadata(client, &archive_url)?;
-    let metadata = parse_bing_metadata(&metadata_body)?;
-
-    let mut last_error: Option<WallpaperError> = None;
-    for res in resolutions {
-        match download_image(client, &url_base, &res, settings, &metadata_body) {
-            Ok(downloaded) => {
-                let candidate = WallpaperCandidate {
-                    id: format!("bing-{date_label}-{res}"),
-                    source: WallpaperSource::Bing,
-                    title: metadata.headline.clone(),
-                    description: None,
-                    attribution: metadata.copyright.clone(),
-                    info_url: metadata.copyright_link.clone(),
-                    image_url: downloaded.image_url.clone(),
-                    local_path: downloaded.path.clone(),
-                    date: date_label.to_string(),
-                    metadata_xml: Some(String::from_utf8_lossy(&metadata_body).to_string()),
-                };
-
-                cache.upsert_candidate(date_label, candidate.clone())?;
-
-                return Ok(FetchedCandidate {
-                    candidate,
-                    skipped_download: downloaded.skipped,
-                });
-            }
-            Err(err) => {
-                log(&format!("Resolution {res} failed: {err}"), settings.quiet);
-                last_error = Some(err);
-            }
-        }
-    }
-
-    if let Some(err) = last_error {
-        Err(err)
-    } else {
-        Err(WallpaperError::Message(
-            "Unable to download wallpaper for any resolution.".to_string(),
-        ))
-    }
-}
-
 fn run_choose(
     client: &Client,
     cache: &CacheManager,
@@ -814,239 +731,10 @@ fn source_label(source: WallpaperSource) -> &'static str {
     }
 }
 
-fn build_archive_url(day: i32, country: Option<&str>) -> String {
-    let mut serializer = form_urlencoded::Serializer::new(String::new());
-    serializer.append_pair("format", "xml");
-    serializer.append_pair("idx", &day.to_string());
-    serializer.append_pair("n", "1");
-    if let Some(c) = country {
-        serializer.append_pair("mkt", c);
-    }
-    format!("{BING_ARCHIVE_URL}?{}", serializer.finish())
-}
-
-fn build_spotlight_url(settings: &Settings) -> String {
-    if let Some(override_url) = &settings.spotlight_url_override {
-        return override_url.clone();
-    }
-    let (country, locale) = match &settings.country {
-        Some(c) => {
-            let parts: Vec<&str> = c.split('-').collect();
-            let country = parts
-                .first()
-                .map(|s| s.to_uppercase())
-                .unwrap_or_else(|| SPOTLIGHT_DEFAULT_COUNTRY.to_string());
-            (country, c.clone())
-        }
-        None => (
-            SPOTLIGHT_DEFAULT_COUNTRY.to_string(),
-            SPOTLIGHT_DEFAULT_LOCALE.to_string(),
-        ),
-    };
-    let mut serializer = form_urlencoded::Serializer::new(String::new());
-    serializer.append_pair("placement", "88000820");
-    serializer.append_pair("bcnt", &SPOTLIGHT_COUNT.to_string());
-    serializer.append_pair("country", &country);
-    serializer.append_pair("locale", &locale);
-    serializer.append_pair("fmt", "json");
-    format!("{SPOTLIGHT_URL}?{}", serializer.finish())
-}
-
-fn fetch_image_metadata(client: &Client, archive_url: &str) -> Result<(String, Vec<u8>)> {
-    let response = client.get(archive_url).timeout(METADATA_TIMEOUT).send()?;
-
-    let status = response.status();
-    if status != StatusCode::OK {
-        return Err(WallpaperError::Status {
-            url: archive_url.to_string(),
-            status: status.as_u16(),
-        });
-    }
-
-    let body = response.bytes()?.to_vec();
-    let url_base = parse_xml_text(&body, "urlBase")?.ok_or(WallpaperError::MissingImageUrl)?;
-    Ok((url_base, body))
-}
-
-#[derive(Debug, Default, Clone)]
-struct BingMetadata {
-    headline: Option<String>,
-    copyright: Option<String>,
-    copyright_link: Option<String>,
-}
-
-fn parse_bing_metadata(body: &[u8]) -> Result<BingMetadata> {
-    let text = std::str::from_utf8(body).map_err(|_| WallpaperError::MetadataParse)?;
-    let doc = roxmltree::Document::parse(text).map_err(|_| WallpaperError::MetadataParse)?;
-    let headline = doc
-        .descendants()
-        .find(|n| n.has_tag_name("headline"))
-        .and_then(|n| n.text())
-        .map(|t| t.to_string());
-    let copyright = doc
-        .descendants()
-        .find(|n| n.has_tag_name("copyright"))
-        .and_then(|n| n.text())
-        .map(|t| t.to_string());
-    let copyright_link = doc
-        .descendants()
-        .find(|n| n.has_tag_name("copyrightlink"))
-        .and_then(|n| n.text())
-        .map(|t| t.to_string());
-    Ok(BingMetadata {
-        headline,
-        copyright,
-        copyright_link,
-    })
-}
-
-fn parse_xml_text(body: &[u8], tag: &str) -> Result<Option<String>> {
-    let text = std::str::from_utf8(body).map_err(|_| WallpaperError::MetadataParse)?;
-    let doc = roxmltree::Document::parse(text).map_err(|_| WallpaperError::MetadataParse)?;
-    Ok(doc
-        .descendants()
-        .find(|node| node.has_tag_name(tag))
-        .and_then(|node| node.text().map(|t| t.to_string())))
-}
-
-fn sanitize_filename(name: &str) -> String {
-    let trimmed = name.trim();
-    if trimmed.is_empty() {
-        return "wallpaper.jpg".to_string();
-    }
-
-    let path = Path::new(trimmed);
-    let base = path
-        .file_name()
-        .unwrap_or_else(|| OsStr::new("wallpaper.jpg"))
-        .to_string_lossy()
-        .to_string();
-    if Path::new(&base).extension().is_some() {
-        base
-    } else {
-        format!("{base}.jpg")
-    }
-}
-
-#[derive(Debug)]
-struct DownloadedImage {
-    path: PathBuf,
-    skipped: bool,
-    image_url: String,
-}
-
 #[derive(Debug)]
 struct DownloadedFile {
     path: PathBuf,
 }
-
-fn download_image(
-    client: &Client,
-    url_base: &str,
-    resolution: &str,
-    settings: &Settings,
-    metadata_body: &[u8],
-) -> Result<DownloadedImage> {
-    let file_url_with_res = format!("{url_base}_{resolution}.jpg");
-    let file_url = format!(
-        "{}://{}/{}",
-        settings.proto,
-        settings.bing_host,
-        file_url_with_res.trim_start_matches('/')
-    );
-
-    let filename_local = if let Some(name) = &settings.filename {
-        sanitize_filename(name)
-    } else {
-        file_url_with_res.replace("/th?id=", "")
-    };
-    let filename_local = format!("{}-{filename_local}", settings.auto_update_name);
-    let target_path = settings.picture_dir.join(filename_local);
-
-    if target_path.exists() && !settings.force {
-        let name = target_path
-            .file_name()
-            .map(|n| n.to_string_lossy())
-            .unwrap_or_else(|| target_path.to_string_lossy());
-        log(
-            &format!("Skipping download, already present: {name}"),
-            settings.quiet,
-        );
-        return Ok(DownloadedImage {
-            path: target_path,
-            skipped: true,
-            image_url: file_url,
-        });
-    }
-
-    log(
-        &format!("Downloading {resolution} from {file_url}"),
-        settings.quiet,
-    );
-
-    let temp_path = unique_temp_path(&target_path);
-    let download_result = (|| -> Result<()> {
-        let _ = fs::remove_file(&temp_path);
-
-        let mut response = client
-            .get(&file_url)
-            .timeout(IMAGE_TIMEOUT)
-            .send()
-            .map_err(|err| WallpaperError::Download {
-                resolution: resolution.to_string(),
-                source: err,
-            })?;
-
-        let status = response.status();
-        if status != StatusCode::OK {
-            return Err(WallpaperError::DownloadStatus {
-                resolution: resolution.to_string(),
-                status: status.as_u16(),
-            });
-        }
-
-        let mut file = File::create(&temp_path)?;
-        response
-            .copy_to(&mut file)
-            .map_err(|err| WallpaperError::Download {
-                resolution: resolution.to_string(),
-                source: err,
-            })?;
-        file.flush()?;
-        file.sync_all()?;
-
-        for entry in fs::read_dir(&settings.picture_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path == target_path {
-                continue;
-            }
-            if path.extension().and_then(|ext| ext.to_str()) == Some("jpg") {
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if name.starts_with(&format!("{}-", settings.auto_update_name)) {
-                        let _ = fs::remove_file(path);
-                    }
-                }
-            }
-        }
-
-        fs::rename(&temp_path, &target_path)?;
-        write_bytes_atomic(&settings.picture_dir.join("info.xml"), metadata_body)?;
-        Ok(())
-    })();
-
-    if let Err(err) = download_result {
-        let _ = fs::remove_file(&temp_path);
-        return Err(err);
-    }
-
-    Ok(DownloadedImage {
-        path: target_path,
-        skipped: false,
-        image_url: file_url,
-    })
-}
-
 fn download_to_path(
     client: &Client,
     url: &str,
@@ -1135,383 +823,6 @@ fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         return Err(err);
     }
     Ok(())
-}
-
-#[derive(Debug, Deserialize)]
-struct SpotlightResponse {
-    #[serde(default)]
-    batchrsp: Option<SpotlightBatch>,
-}
-
-#[derive(Debug, Deserialize)]
-struct SpotlightBatch {
-    #[serde(default)]
-    items: Vec<SpotlightItemWrapper>,
-}
-
-#[derive(Debug, Deserialize)]
-struct SpotlightItemWrapper {
-    item: SpotlightItem,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum SpotlightItem {
-    RawString(String),
-    Object(SpotlightPayload),
-}
-
-#[derive(Debug, Deserialize, Clone)]
-struct SpotlightPayload {
-    #[serde(default)]
-    ad: SpotlightAd,
-}
-
-#[derive(Debug, Deserialize, Clone, Default)]
-struct SpotlightAd {
-    #[serde(default)]
-    title: Option<String>,
-    #[serde(default)]
-    description: Option<String>,
-    #[serde(default)]
-    copyright: Option<String>,
-    #[serde(default, rename = "ctaUri")]
-    cta_uri: Option<String>,
-    #[serde(default, rename = "landscapeImage")]
-    landscape_image: Option<SpotlightImage>,
-    #[serde(default, rename = "entityId")]
-    _entity_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-struct SpotlightImage {
-    asset: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ApodResponse {
-    #[serde(default)]
-    url: String,
-    #[serde(default)]
-    hdurl: Option<String>,
-    #[serde(default, rename = "media_type")]
-    media_type: String,
-    #[serde(default)]
-    title: Option<String>,
-    #[serde(default)]
-    explanation: Option<String>,
-    #[serde(default)]
-    copyright: Option<String>,
-}
-
-#[cfg(test)]
-fn run_spotlight(
-    client: &Client,
-    cache: &CacheManager,
-    settings: &Settings,
-    date_label: &str,
-    pick_index: usize,
-) -> Result<()> {
-    let mut patched_settings = settings.clone();
-    patched_settings.spotlight_index = pick_index;
-    let registry = SourceRegistry::new();
-    let source = require_source(&registry, WallpaperSource::Spotlight)?;
-    let ctx = SourceContext {
-        client,
-        cache,
-        settings: &patched_settings,
-        date_label,
-        resolutions: &[],
-    };
-    run_source(source, &ctx)
-}
-
-fn fetch_spotlight_candidates(
-    client: &Client,
-    cache: &CacheManager,
-    settings: &Settings,
-    date_label: &str,
-) -> Result<Vec<WallpaperCandidate>> {
-    if !settings.force {
-        if let Some(index) = cache.load_index(date_label)? {
-            let existing: Vec<_> = index
-                .candidates
-                .into_iter()
-                .filter(|c| c.source == WallpaperSource::Spotlight && c.local_path.exists())
-                .collect();
-            if !existing.is_empty() {
-                return Ok(existing);
-            }
-        }
-    }
-
-    let url = build_spotlight_url(settings);
-    let response = client.get(url.clone()).timeout(METADATA_TIMEOUT).send()?;
-    if response.status() != StatusCode::OK {
-        return Err(WallpaperError::Status {
-            url,
-            status: response.status().as_u16(),
-        });
-    }
-    let body = response.bytes()?.to_vec();
-    let payloads = parse_spotlight_payloads(&body)?;
-    if payloads.is_empty() {
-        return Err(WallpaperError::Message(
-            "Spotlight response did not include any images.".to_string(),
-        ));
-    }
-
-    let media_dir = cache.media_dir(date_label, WallpaperSource::Spotlight);
-    fs::create_dir_all(&media_dir)?;
-
-    let mut candidates = Vec::new();
-    for (idx, payload) in payloads.into_iter().take(SPOTLIGHT_COUNT).enumerate() {
-        let Some(image) = payload.ad.landscape_image.clone() else {
-            continue;
-        };
-        let asset_url = image.asset;
-        let ordinal = idx + 1;
-        let file_name = format!("spotlight_{date_label}_{ordinal}.jpg");
-        let local_path = media_dir.join(file_name);
-
-        let download = download_to_path(
-            client,
-            &asset_url,
-            &local_path,
-            settings.force,
-            settings.quiet,
-        )?;
-
-        let candidate_id = format!("spotlight-{date_label}-{ordinal}");
-        let candidate = WallpaperCandidate {
-            id: candidate_id,
-            source: WallpaperSource::Spotlight,
-            title: payload.ad.title.clone(),
-            description: payload.ad.description.clone(),
-            attribution: payload.ad.copyright.clone(),
-            info_url: payload
-                .ad
-                .cta_uri
-                .as_ref()
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .map(strip_edge_scheme),
-            image_url: asset_url,
-            local_path: download.path,
-            date: date_label.to_string(),
-            metadata_xml: None,
-        };
-        cache.upsert_candidate(date_label, candidate.clone())?;
-        candidates.push(candidate);
-    }
-
-    Ok(candidates)
-}
-
-fn parse_spotlight_payloads(body: &[u8]) -> Result<Vec<SpotlightPayload>> {
-    let parsed: SpotlightResponse = serde_json::from_slice(body)?;
-    let Some(batch) = parsed.batchrsp else {
-        return Ok(Vec::new());
-    };
-    let mut items = Vec::new();
-    for wrapper in batch.items {
-        match wrapper.item {
-            SpotlightItem::RawString(raw) => {
-                if let Ok(obj) = serde_json::from_str::<SpotlightPayload>(&raw) {
-                    items.push(obj);
-                }
-            }
-            SpotlightItem::Object(obj) => items.push(obj),
-        }
-    }
-    Ok(items)
-}
-
-fn strip_edge_scheme(url: &str) -> String {
-    let trimmed = url.trim();
-    if let Some(rest) = trimmed.strip_prefix("microsoft-edge:") {
-        rest.to_string()
-    } else {
-        trimmed.to_string()
-    }
-}
-
-#[cfg(test)]
-fn run_apod(
-    client: &Client,
-    cache: &CacheManager,
-    settings: &Settings,
-    date_label: &str,
-) -> Result<()> {
-    let registry = SourceRegistry::new();
-    let source = require_source(&registry, WallpaperSource::Apod)?;
-    let ctx = SourceContext {
-        client,
-        cache,
-        settings,
-        date_label,
-        resolutions: &[],
-    };
-    run_source(source, &ctx)
-}
-
-fn fetch_apod_candidate(
-    client: &Client,
-    cache: &CacheManager,
-    settings: &Settings,
-    date_label: &str,
-) -> Result<WallpaperCandidate> {
-    let candidate_id = format!("apod-{date_label}");
-    if !settings.force {
-        if let Some(candidate) = cache.find_candidate_by_id(date_label, &candidate_id)? {
-            if candidate.local_path.exists() {
-                log(
-                    &format!("Using cached APOD wallpaper for {}", date_label),
-                    settings.quiet,
-                );
-                return Ok(candidate);
-            }
-        }
-    }
-
-    let apod = fetch_apod(client, settings, date_label)?;
-    if apod.media_type != "image" {
-        return Err(WallpaperError::Message(
-            "APOD media type is not an image; skipping.".to_string(),
-        ));
-    }
-    let image_url = if settings.apod_hd {
-        apod.hdurl.clone().unwrap_or(apod.url.clone())
-    } else {
-        apod.url.clone()
-    };
-    if image_url.is_empty() {
-        return Err(WallpaperError::Message(
-            "APOD response missing image URL.".to_string(),
-        ));
-    }
-
-    let media_dir = cache.media_dir(date_label, WallpaperSource::Apod);
-    fs::create_dir_all(&media_dir)?;
-    let file_name = format!("apod_{date_label}.jpg");
-    let target_path = media_dir.join(file_name);
-    let download = download_to_path(
-        client,
-        &image_url,
-        &target_path,
-        settings.force,
-        settings.quiet,
-    )?;
-
-    let candidate = WallpaperCandidate {
-        id: candidate_id,
-        source: WallpaperSource::Apod,
-        title: apod.title.clone(),
-        description: apod.explanation.clone(),
-        attribution: apod.copyright.clone(),
-        info_url: None,
-        image_url,
-        local_path: download.path,
-        date: date_label.to_string(),
-        metadata_xml: None,
-    };
-    if settings.apod_crop {
-        if let Err(err) = crop_and_resize_apod(&candidate.local_path) {
-            log(
-                &format!("APOD crop/resize failed; using original image. {err}"),
-                settings.quiet,
-            );
-        }
-    }
-
-    cache.upsert_candidate(date_label, candidate.clone())?;
-    Ok(candidate)
-}
-
-fn fetch_apod(client: &Client, settings: &Settings, date_label: &str) -> Result<ApodResponse> {
-    let mut serializer = form_urlencoded::Serializer::new(String::new());
-    serializer.append_pair("api_key", &settings.apod_api_key);
-    serializer.append_pair("date", date_label);
-    let base = settings.apod_url_override.as_deref().unwrap_or(APOD_URL);
-    let url = format!("{base}?{}", serializer.finish());
-    let response = client.get(&url).timeout(METADATA_TIMEOUT).send()?;
-    if response.status() != StatusCode::OK {
-        return Err(WallpaperError::Status {
-            url,
-            status: response.status().as_u16(),
-        });
-    }
-    let body = response.bytes()?.to_vec();
-    let parsed: ApodResponse = serde_json::from_slice(&body)?;
-    Ok(parsed)
-}
-
-fn crop_and_resize_apod(path: &Path) -> Result<()> {
-    let img = image::open(path)
-        .map_err(|err| WallpaperError::Message(format!("Unable to read APOD image: {err}")))?;
-    let (orig_w, orig_h) = img.dimensions();
-    if orig_w == 0 || orig_h == 0 {
-        return Ok(());
-    }
-
-    let (target_w, target_h) = detect_primary_display_size().unwrap_or((16, 9));
-    let target_aspect = target_w as f32 / target_h as f32;
-    let orig_aspect = orig_w as f32 / orig_h as f32;
-
-    let (crop_w, crop_h) = if orig_aspect > target_aspect {
-        let new_w = (orig_h as f32 * target_aspect).round().max(1.0) as u32;
-        (new_w.min(orig_w), orig_h)
-    } else {
-        let new_h = (orig_w as f32 / target_aspect).round().max(1.0) as u32;
-        (orig_w, new_h.min(orig_h))
-    };
-    let x0 = (orig_w - crop_w) / 2;
-    let y0 = (orig_h - crop_h) / 2;
-    let cropped = img.crop_imm(x0, y0, crop_w, crop_h);
-
-    let processed = if target_w > 0 && target_h > 0 {
-        image::imageops::resize(&cropped, target_w, target_h, FilterType::Lanczos3)
-    } else {
-        cropped.to_rgba8()
-    };
-
-    let temp_path = unique_temp_path(path);
-    processed.save(&temp_path).map_err(|err| {
-        WallpaperError::Message(format!("Unable to save processed APOD image: {err}"))
-    })?;
-    if let Ok(f) = File::open(&temp_path) {
-        let _ = f.sync_all();
-    }
-    fs::rename(&temp_path, path)?;
-    Ok(())
-}
-
-fn detect_primary_display_size() -> Option<(u32, u32)> {
-    let output = Command::new("system_profiler")
-        .args(["SPDisplaysDataType", "-json"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
-    let displays = value.get("SPDisplaysDataType")?.as_array()?;
-    let first = displays.first()?;
-    let ndrv = first.get("spdisplays_ndrvs")?.as_array()?.first()?;
-    let res_str = ndrv.get("spdisplays_resolution")?.as_str()?;
-    parse_resolution(res_str)
-}
-
-fn parse_resolution(res_str: &str) -> Option<(u32, u32)> {
-    let parts: Vec<&str> = res_str
-        .split(|c| c == 'x' || c == '×' || c == ',')
-        .collect();
-    if parts.len() < 2 {
-        return None;
-    }
-    let w = parts.get(0)?.trim().parse().ok()?;
-    let h = parts.get(1)?.trim().parse().ok()?;
-    Some((w, h))
 }
 
 fn prune_cache(cache: &CacheManager, keep_days: u32, quiet: bool) -> Result<()> {
@@ -1760,7 +1071,7 @@ fn show_info(picture_dir: &Path) -> Result<()> {
     let mut body = Vec::new();
     File::open(&info_path)?.read_to_end(&mut body)?;
 
-    let metadata = parse_bing_metadata(&body)?;
+    let metadata = crate::sources::bing::parse_bing_metadata(&body)?;
 
     let mut info = String::new();
     if let Some(headline) = &metadata.headline {
@@ -1816,6 +1127,7 @@ impl ExpandTilde for PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sources::bing;
     use httpmock::Method::GET;
     use httpmock::MockServer;
     use tempfile::tempdir;
@@ -1844,6 +1156,26 @@ mod tests {
         }
     }
 
+    fn run_source_for_test(
+        source_id: WallpaperSource,
+        client: &Client,
+        cache: &CacheManager,
+        settings: &Settings,
+        date_label: &str,
+        resolutions: &[String],
+    ) -> Result<()> {
+        let registry = SourceRegistry::new();
+        let source = require_source(&registry, source_id)?;
+        let ctx = SourceContext {
+            client,
+            cache,
+            settings,
+            date_label,
+            resolutions,
+        };
+        run_source(source, &ctx)
+    }
+
     #[test]
     fn normalize_auto_update_name_cleans() {
         assert_eq!(normalize_auto_update_name("  "), "default");
@@ -1853,14 +1185,14 @@ mod tests {
 
     #[test]
     fn sanitize_filename_behaves_like_python() {
-        assert_eq!(sanitize_filename(""), "wallpaper.jpg");
-        assert_eq!(sanitize_filename("custom"), "custom.jpg");
-        assert_eq!(sanitize_filename("dir/../name.png"), "name.png");
+        assert_eq!(bing::sanitize_filename(""), "wallpaper.jpg");
+        assert_eq!(bing::sanitize_filename("custom"), "custom.jpg");
+        assert_eq!(bing::sanitize_filename("dir/../name.png"), "name.png");
     }
 
     #[test]
     fn build_archive_url_includes_country() {
-        let url = build_archive_url(1, Some("en-US"));
+        let url = bing::build_archive_url(1, Some("en-US"));
         assert!(url.contains("idx=1"));
         assert!(url.contains("mkt=en-US"));
     }
@@ -1892,7 +1224,7 @@ mod tests {
             then.status(200).body("image-bytes");
         });
 
-        let downloaded = download_image(&client, url_base, res, &settings, metadata).unwrap();
+        let downloaded = bing::download_image(&client, url_base, res, &settings, metadata).unwrap();
         assert!(downloaded.skipped);
         assert_eq!(downloaded.path, target);
         assert_eq!(_mock.hits(), 0);
@@ -1921,7 +1253,7 @@ mod tests {
             then.status(200).body("image-bytes");
         });
 
-        let downloaded = download_image(&client, url_base, res, &settings, metadata).unwrap();
+        let downloaded = bing::download_image(&client, url_base, res, &settings, metadata).unwrap();
         assert!(!downloaded.skipped);
         assert!(downloaded.path.exists());
         assert_eq!(fs::read(&downloaded.path).unwrap(), b"image-bytes");
@@ -1956,7 +1288,7 @@ mod tests {
             then.status(404);
         });
 
-        let err = download_image(&client, url_base, res, &settings, metadata).unwrap_err();
+        let err = bing::download_image(&client, url_base, res, &settings, metadata).unwrap_err();
         assert!(matches!(err, WallpaperError::DownloadStatus { .. }));
         assert!(!target.exists());
 
@@ -2027,12 +1359,13 @@ mod tests {
         let client = build_client().unwrap();
         let date_label = Local::now().date_naive().to_string();
 
-        run_spotlight(
+        run_source_for_test(
+            WallpaperSource::Spotlight,
             &client,
             &cache,
             &settings,
             &date_label,
-            settings.spotlight_index,
+            &[],
         )
         .unwrap();
         assert_eq!(api_mock.hits(), 1);
@@ -2041,12 +1374,13 @@ mod tests {
         assert_eq!(img3_mock.hits(), 1);
 
         // Second run should reuse cache and skip network.
-        run_spotlight(
+        run_source_for_test(
+            WallpaperSource::Spotlight,
             &client,
             &cache,
             &settings,
             &date_label,
-            settings.spotlight_index,
+            &[],
         )
         .unwrap();
         assert_eq!(api_mock.hits(), 1);
@@ -2092,12 +1426,28 @@ mod tests {
         let client = build_client().unwrap();
         let date_label = "2024-01-01";
 
-        run_apod(&client, &cache, &settings, date_label).unwrap();
+        run_source_for_test(
+            WallpaperSource::Apod,
+            &client,
+            &cache,
+            &settings,
+            date_label,
+            &[],
+        )
+        .unwrap();
         assert_eq!(api_mock.hits(), 1);
         assert_eq!(img_mock.hits(), 1);
 
         // second run should reuse cache
-        run_apod(&client, &cache, &settings, date_label).unwrap();
+        run_source_for_test(
+            WallpaperSource::Apod,
+            &client,
+            &cache,
+            &settings,
+            date_label,
+            &[],
+        )
+        .unwrap();
         assert_eq!(api_mock.hits(), 1);
         assert_eq!(img_mock.hits(), 1);
     }
@@ -2131,7 +1481,15 @@ mod tests {
         let client = build_client().unwrap();
         let date_label = "2024-01-02";
 
-        let err = run_apod(&client, &cache, &settings, date_label).unwrap_err();
+        let err = run_source_for_test(
+            WallpaperSource::Apod,
+            &client,
+            &cache,
+            &settings,
+            date_label,
+            &[],
+        )
+        .unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("not an image"));
         assert_eq!(api_mock.hits(), 1);
