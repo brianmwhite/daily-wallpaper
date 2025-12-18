@@ -461,10 +461,8 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
             return Ok(());
         }
         Some(CommandArg::Choose) => {
-            log(
-                "Choose mode will show an interactive list in a future phase; using Bing for now.",
-                settings.quiet,
-            );
+            ensure_picture_dir(&settings.picture_dir)?;
+            return run_choose(&client, &cache, &settings, &date_label, resolutions);
         }
         None => {}
     }
@@ -473,7 +471,13 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
 
     match settings.source {
         WallpaperSource::Bing => run_bing(&client, &cache, &settings, &date_label, resolutions),
-        WallpaperSource::Spotlight => run_spotlight(&client, &cache, &settings, &date_label),
+        WallpaperSource::Spotlight => run_spotlight(
+            &client,
+            &cache,
+            &settings,
+            &date_label,
+            settings.spotlight_index,
+        ),
         WallpaperSource::Apod => run_apod(&client, &cache, &settings, &date_label),
     }
 }
@@ -540,6 +544,36 @@ fn run_bing(
     date_label: &str,
     resolutions: Vec<String>,
 ) -> Result<()> {
+    let fetched = fetch_bing_candidate(client, cache, settings, date_label, resolutions)?;
+    if settings.experimental && fetched.skipped_download {
+        log(
+            "Download skipped; experimental all-desktops update not applied.",
+            settings.quiet,
+        );
+        return Ok(());
+    }
+
+    apply_wallpaper(
+        &fetched.candidate.local_path,
+        settings,
+        cache,
+        &fetched.candidate.id,
+        fetched.candidate.source,
+    )
+}
+
+struct FetchedCandidate {
+    candidate: WallpaperCandidate,
+    skipped_download: bool,
+}
+
+fn fetch_bing_candidate(
+    client: &Client,
+    cache: &CacheManager,
+    settings: &Settings,
+    date_label: &str,
+    resolutions: Vec<String>,
+) -> Result<FetchedCandidate> {
     if !settings.force {
         if let Some(candidate) = cache.find_candidate(date_label, WallpaperSource::Bing)? {
             if candidate.local_path.exists() {
@@ -551,14 +585,10 @@ fn run_bing(
                     settings.quiet,
                 );
                 ensure_info_file(&settings.picture_dir, &candidate)?;
-                apply_wallpaper(
-                    &candidate.local_path,
-                    settings,
-                    cache,
-                    &candidate.id,
-                    candidate.source,
-                )?;
-                return Ok(());
+                return Ok(FetchedCandidate {
+                    candidate,
+                    skipped_download: true,
+                });
             }
         }
     }
@@ -584,29 +614,12 @@ fn run_bing(
                     metadata_xml: Some(String::from_utf8_lossy(&metadata_body).to_string()),
                 };
 
-                if settings.experimental && downloaded.skipped {
-                    log(
-                        "Download skipped; experimental all-desktops update not applied.",
-                        settings.quiet,
-                    );
-                    cache.upsert_candidate(date_label, candidate)?;
-                    return Ok(());
-                }
+                cache.upsert_candidate(date_label, candidate.clone())?;
 
-                let result = apply_wallpaper(
-                    &downloaded.path,
-                    settings,
-                    cache,
-                    &candidate.id,
-                    candidate.source,
-                );
-                cache.upsert_candidate(date_label, candidate)?;
-
-                if let Err(err) = result {
-                    last_error = Some(err);
-                    continue;
-                }
-                return Ok(());
+                return Ok(FetchedCandidate {
+                    candidate,
+                    skipped_download: downloaded.skipped,
+                });
             }
             Err(err) => {
                 log(&format!("Resolution {res} failed: {err}"), settings.quiet);
@@ -621,6 +634,137 @@ fn run_bing(
         Err(WallpaperError::Message(
             "Unable to download wallpaper for any resolution.".to_string(),
         ))
+    }
+}
+
+fn run_choose(
+    client: &Client,
+    cache: &CacheManager,
+    settings: &Settings,
+    date_label: &str,
+    resolutions: Vec<String>,
+) -> Result<()> {
+    let mut current_settings = settings.clone();
+    let current_res = resolutions;
+
+    loop {
+        let candidates =
+            gather_candidates(client, cache, &current_settings, date_label, &current_res)?;
+        if candidates.is_empty() {
+            return Err(WallpaperError::Message(
+                "No wallpapers available to choose from.".to_string(),
+            ));
+        }
+
+        println!("Available wallpapers:");
+        for (idx, cand) in candidates.iter().enumerate() {
+            let title = cand
+                .title
+                .as_deref()
+                .filter(|t| !t.is_empty())
+                .unwrap_or("(no title)");
+            let attribution = cand
+                .attribution
+                .as_deref()
+                .filter(|t| !t.is_empty())
+                .unwrap_or("");
+            println!(
+                "  {idx}: [{}] {}{}",
+                source_label(cand.source),
+                title,
+                if attribution.is_empty() {
+                    "".to_string()
+                } else {
+                    format!(" — {}", attribution)
+                }
+            );
+        }
+        println!("Enter number to apply, 'p <n>' to preview, 'r' to refresh (force), 'q' to quit.");
+        print!("Choice: ");
+        let _ = io::stdout().flush();
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.eq_ignore_ascii_case("q") || trimmed.eq_ignore_ascii_case("quit") {
+            return Ok(());
+        }
+        if trimmed.eq_ignore_ascii_case("r") || trimmed.eq_ignore_ascii_case("refresh") {
+            current_settings.force = true;
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("p ") {
+            if let Ok(num) = rest.trim().parse::<usize>() {
+                if let Some(cand) = candidates.get(num) {
+                    if cand.local_path.exists() {
+                        let path_str = cand.local_path.to_string_lossy().to_string();
+                        let _ = run_checked(
+                            "qlmanage",
+                            &["-p", path_str.as_str()],
+                            "Quick Look preview",
+                        );
+                    } else {
+                        println!("File not found for preview: {}", cand.local_path.display());
+                    }
+                }
+            }
+            continue;
+        }
+
+        if let Ok(num) = trimmed.parse::<usize>() {
+            if let Some(cand) = candidates.get(num) {
+                match apply_wallpaper(
+                    &cand.local_path,
+                    &current_settings,
+                    cache,
+                    &cand.id,
+                    cand.source,
+                ) {
+                    Ok(()) => return Ok(()),
+                    Err(err) => {
+                        println!("Failed to apply wallpaper: {err}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn gather_candidates(
+    client: &Client,
+    cache: &CacheManager,
+    settings: &Settings,
+    date_label: &str,
+    resolutions: &[String],
+) -> Result<Vec<WallpaperCandidate>> {
+    let mut result = Vec::new();
+
+    match fetch_bing_candidate(client, cache, settings, date_label, resolutions.to_vec()) {
+        Ok(fetched) => result.push(fetched.candidate),
+        Err(err) => log(&format!("Bing unavailable: {err}"), settings.quiet),
+    }
+
+    match fetch_spotlight_candidates(client, cache, settings, date_label) {
+        Ok(cands) => result.extend(cands),
+        Err(err) => log(&format!("Spotlight unavailable: {err}"), settings.quiet),
+    }
+
+    match fetch_apod_candidate(client, cache, settings, date_label) {
+        Ok(cand) => result.push(cand),
+        Err(err) => log(&format!("APOD unavailable: {err}"), settings.quiet),
+    }
+
+    Ok(result)
+}
+
+fn source_label(source: WallpaperSource) -> &'static str {
+    match source {
+        WallpaperSource::Bing => "Bing",
+        WallpaperSource::Spotlight => "Spotlight",
+        WallpaperSource::Apod => "APOD",
     }
 }
 
@@ -1019,40 +1163,19 @@ fn run_spotlight(
     cache: &CacheManager,
     settings: &Settings,
     date_label: &str,
+    pick_index: usize,
 ) -> Result<()> {
-    let candidate_id = format!("spotlight-{date_label}-{}", settings.spotlight_index);
-    if !settings.force {
-        if let Some(candidate) = cache.find_candidate_by_id(date_label, &candidate_id)? {
-            if candidate.local_path.exists() {
-                log(
-                    &format!(
-                        "Using cached Spotlight wallpaper for {} (index {})",
-                        date_label, settings.spotlight_index
-                    ),
-                    settings.quiet,
-                );
-                return apply_wallpaper(
-                    &candidate.local_path,
-                    settings,
-                    cache,
-                    &candidate.id,
-                    candidate.source,
-                );
-            }
-        }
-    }
-
     let candidates = fetch_spotlight_candidates(client, cache, settings, date_label)?;
     if candidates.is_empty() {
         return Err(WallpaperError::Message(
             "No Spotlight images available.".to_string(),
         ));
     }
-    let idx = settings.spotlight_index.saturating_sub(1);
+    let idx = pick_index.saturating_sub(1);
     if idx >= candidates.len() {
         return Err(WallpaperError::Message(format!(
             "Requested Spotlight index {} not available; {} images found.",
-            settings.spotlight_index,
+            pick_index,
             candidates.len()
         )));
     }
@@ -1072,6 +1195,19 @@ fn fetch_spotlight_candidates(
     settings: &Settings,
     date_label: &str,
 ) -> Result<Vec<WallpaperCandidate>> {
+    if !settings.force {
+        if let Some(index) = cache.load_index(date_label)? {
+            let existing: Vec<_> = index
+                .candidates
+                .into_iter()
+                .filter(|c| c.source == WallpaperSource::Spotlight && c.local_path.exists())
+                .collect();
+            if !existing.is_empty() {
+                return Ok(existing);
+            }
+        }
+    }
+
     let url = build_spotlight_url(settings);
     let response = client.get(url.clone()).timeout(METADATA_TIMEOUT).send()?;
     if response.status() != StatusCode::OK {
@@ -1169,6 +1305,22 @@ fn run_apod(
     settings: &Settings,
     date_label: &str,
 ) -> Result<()> {
+    let candidate = fetch_apod_candidate(client, cache, settings, date_label)?;
+    apply_wallpaper(
+        &candidate.local_path,
+        settings,
+        cache,
+        &candidate.id,
+        candidate.source,
+    )
+}
+
+fn fetch_apod_candidate(
+    client: &Client,
+    cache: &CacheManager,
+    settings: &Settings,
+    date_label: &str,
+) -> Result<WallpaperCandidate> {
     let candidate_id = format!("apod-{date_label}");
     if !settings.force {
         if let Some(candidate) = cache.find_candidate_by_id(date_label, &candidate_id)? {
@@ -1177,13 +1329,7 @@ fn run_apod(
                     &format!("Using cached APOD wallpaper for {}", date_label),
                     settings.quiet,
                 );
-                return apply_wallpaper(
-                    &candidate.local_path,
-                    settings,
-                    cache,
-                    &candidate.id,
-                    candidate.source,
-                );
+                return Ok(candidate);
             }
         }
     }
@@ -1229,8 +1375,6 @@ fn run_apod(
         date: date_label.to_string(),
         metadata_xml: None,
     };
-    cache.upsert_candidate(date_label, candidate.clone())?;
-
     if settings.apod_crop {
         if let Err(err) = crop_and_resize_apod(&candidate.local_path) {
             log(
@@ -1240,13 +1384,8 @@ fn run_apod(
         }
     }
 
-    apply_wallpaper(
-        &candidate.local_path,
-        settings,
-        cache,
-        &candidate.id,
-        candidate.source,
-    )
+    cache.upsert_candidate(date_label, candidate.clone())?;
+    Ok(candidate)
 }
 
 fn fetch_apod(client: &Client, settings: &Settings, date_label: &str) -> Result<ApodResponse> {
@@ -1806,14 +1945,28 @@ mod tests {
         let client = build_client().unwrap();
         let date_label = Local::now().date_naive().to_string();
 
-        run_spotlight(&client, &cache, &settings, &date_label).unwrap();
+        run_spotlight(
+            &client,
+            &cache,
+            &settings,
+            &date_label,
+            settings.spotlight_index,
+        )
+        .unwrap();
         assert_eq!(api_mock.hits(), 1);
         assert_eq!(img1_mock.hits(), 1);
         assert_eq!(img2_mock.hits(), 1);
         assert_eq!(img3_mock.hits(), 1);
 
         // Second run should reuse cache and skip network.
-        run_spotlight(&client, &cache, &settings, &date_label).unwrap();
+        run_spotlight(
+            &client,
+            &cache,
+            &settings,
+            &date_label,
+            settings.spotlight_index,
+        )
+        .unwrap();
         assert_eq!(api_mock.hits(), 1);
         assert_eq!(img1_mock.hits(), 1);
         assert_eq!(img2_mock.hits(), 1);
