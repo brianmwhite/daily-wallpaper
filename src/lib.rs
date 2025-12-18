@@ -1,5 +1,7 @@
 use chrono::{Duration as ChronoDuration, Local, NaiveDate};
 use clap::{ArgAction, Parser, ValueEnum};
+use image::imageops::FilterType;
+use image::GenericImageView;
 use plist::{Dictionary, Value};
 use reqwest::blocking::Client;
 use reqwest::StatusCode;
@@ -108,6 +110,7 @@ struct Settings {
     apod_api_key: String,
     apod_hd: bool,
     apod_url_override: Option<String>,
+    apod_crop: bool,
 }
 
 impl Settings {
@@ -314,6 +317,14 @@ struct Cli {
     #[arg(long = "apod-hd", action = ArgAction::SetTrue)]
     apod_hd: bool,
 
+    #[arg(
+        long = "no-apod-crop",
+        action = ArgAction::SetFalse,
+        default_value_t = true,
+        help = "Disable APOD center-crop/resize to monitor aspect ratio"
+    )]
+    apod_crop: bool,
+
     #[arg(short = 's', long = "ssl", default_value_t = true, action = ArgAction::SetTrue)]
     ssl: bool,
 
@@ -422,6 +433,7 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
             .unwrap_or_else(|| APOD_DEFAULT_KEY.to_string()),
         apod_hd: args.apod_hd,
         apod_url_override: None,
+        apod_crop: args.apod_crop,
     };
 
     let cache = CacheManager::new(&settings.picture_dir);
@@ -1219,6 +1231,15 @@ fn run_apod(
     };
     cache.upsert_candidate(date_label, candidate.clone())?;
 
+    if settings.apod_crop {
+        if let Err(err) = crop_and_resize_apod(&candidate.local_path) {
+            log(
+                &format!("APOD crop/resize failed; using original image. {err}"),
+                settings.quiet,
+            );
+        }
+    }
+
     apply_wallpaper(
         &candidate.local_path,
         settings,
@@ -1244,6 +1265,74 @@ fn fetch_apod(client: &Client, settings: &Settings, date_label: &str) -> Result<
     let body = response.bytes()?.to_vec();
     let parsed: ApodResponse = serde_json::from_slice(&body)?;
     Ok(parsed)
+}
+
+fn crop_and_resize_apod(path: &Path) -> Result<()> {
+    let img = image::open(path)
+        .map_err(|err| WallpaperError::Message(format!("Unable to read APOD image: {err}")))?;
+    let (orig_w, orig_h) = img.dimensions();
+    if orig_w == 0 || orig_h == 0 {
+        return Ok(());
+    }
+
+    let (target_w, target_h) = detect_primary_display_size().unwrap_or((16, 9));
+    let target_aspect = target_w as f32 / target_h as f32;
+    let orig_aspect = orig_w as f32 / orig_h as f32;
+
+    let (crop_w, crop_h) = if orig_aspect > target_aspect {
+        let new_w = (orig_h as f32 * target_aspect).round().max(1.0) as u32;
+        (new_w.min(orig_w), orig_h)
+    } else {
+        let new_h = (orig_w as f32 / target_aspect).round().max(1.0) as u32;
+        (orig_w, new_h.min(orig_h))
+    };
+    let x0 = (orig_w - crop_w) / 2;
+    let y0 = (orig_h - crop_h) / 2;
+    let cropped = img.crop_imm(x0, y0, crop_w, crop_h);
+
+    let processed = if target_w > 0 && target_h > 0 {
+        image::imageops::resize(&cropped, target_w, target_h, FilterType::Lanczos3)
+    } else {
+        cropped.to_rgba8()
+    };
+
+    let temp_path = unique_temp_path(path);
+    processed.save(&temp_path).map_err(|err| {
+        WallpaperError::Message(format!("Unable to save processed APOD image: {err}"))
+    })?;
+    if let Ok(f) = File::open(&temp_path) {
+        let _ = f.sync_all();
+    }
+    fs::rename(&temp_path, path)?;
+    Ok(())
+}
+
+fn detect_primary_display_size() -> Option<(u32, u32)> {
+    let output = Command::new("system_profiler")
+        .args(["SPDisplaysDataType", "-json"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let displays = value.get("SPDisplaysDataType")?.as_array()?;
+    let first = displays.first()?;
+    let ndrv = first.get("spdisplays_ndrvs")?.as_array()?.first()?;
+    let res_str = ndrv.get("spdisplays_resolution")?.as_str()?;
+    parse_resolution(res_str)
+}
+
+fn parse_resolution(res_str: &str) -> Option<(u32, u32)> {
+    let parts: Vec<&str> = res_str
+        .split(|c| c == 'x' || c == '×' || c == ',')
+        .collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let w = parts.get(0)?.trim().parse().ok()?;
+    let h = parts.get(1)?.trim().parse().ok()?;
+    Some((w, h))
 }
 
 fn apply_wallpaper(
@@ -1530,6 +1619,7 @@ mod tests {
             apod_api_key: "TEST".into(),
             apod_hd: false,
             apod_url_override: None,
+            apod_crop: true,
         }
     }
 
@@ -1761,6 +1851,7 @@ mod tests {
         settings.source = WallpaperSource::Apod;
         settings.apod_api_key = "TEST".into();
         settings.apod_url_override = Some(api_url);
+        settings.apod_crop = false;
 
         let cache = CacheManager::new(tmpdir.path());
         let client = build_client().unwrap();
@@ -1799,6 +1890,7 @@ mod tests {
         settings.source = WallpaperSource::Apod;
         settings.apod_api_key = "TEST".into();
         settings.apod_url_override = Some(api_url);
+        settings.apod_crop = false;
 
         let cache = CacheManager::new(tmpdir.path());
         let client = build_client().unwrap();
