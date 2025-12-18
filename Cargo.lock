@@ -334,6 +334,8 @@ dependencies = [
  "reqwest",
  "roxmltree",
  "rusqlite",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror 1.0.69",
  "url",

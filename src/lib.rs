@@ -1,9 +1,11 @@
-use chrono::Local;
+use chrono::{Duration as ChronoDuration, Local, NaiveDate};
 use clap::{ArgAction, Parser, ValueEnum};
 use plist::{Dictionary, Value};
 use reqwest::blocking::Client;
 use reqwest::StatusCode;
 use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
+use serde_json;
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
@@ -31,6 +33,9 @@ const USER_AGENT: &str = concat!(
 const METADATA_TIMEOUT: Duration = Duration::from_secs(30);
 const IMAGE_TIMEOUT: Duration = Duration::from_secs(60);
 const PLIST_BASENAME: &str = "com.bing-wallpaper-daily-mac-multimonitor";
+const CACHE_DIR_NAME: &str = "cache";
+const CACHE_INDEX_FILE: &str = "index.json";
+const LAST_APPLIED_FILE: &str = "last_applied.json";
 
 pub type Result<T> = std::result::Result<T, WallpaperError>;
 
@@ -66,6 +71,8 @@ pub enum WallpaperError {
     Plist(#[from] plist::Error),
     #[error(transparent)]
     Db(#[from] rusqlite::Error),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
 }
 
 #[derive(Debug, Clone)]
@@ -93,11 +100,137 @@ impl Settings {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+enum WallpaperSource {
+    Bing,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WallpaperCandidate {
+    id: String,
+    source: WallpaperSource,
+    title: Option<String>,
+    description: Option<String>,
+    attribution: Option<String>,
+    info_url: Option<String>,
+    image_url: String,
+    local_path: PathBuf,
+    date: String,
+    metadata_xml: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct CacheIndex {
+    date: String,
+    candidates: Vec<WallpaperCandidate>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LastApplied {
+    candidate_id: String,
+    source: WallpaperSource,
+    applied_path: PathBuf,
+    applied_at: u64,
+}
+
+struct CacheManager {
+    base_dir: PathBuf,
+}
+
+impl CacheManager {
+    fn new(picture_dir: &Path) -> Self {
+        Self {
+            base_dir: picture_dir.join(CACHE_DIR_NAME),
+        }
+    }
+
+    fn index_path(&self, date: &str) -> PathBuf {
+        self.base_dir.join(date).join(CACHE_INDEX_FILE)
+    }
+
+    fn last_applied_path(&self) -> PathBuf {
+        self.base_dir.join(LAST_APPLIED_FILE)
+    }
+
+    fn load_index(&self, date: &str) -> Result<Option<CacheIndex>> {
+        let path = self.index_path(date);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let data = fs::read(&path)?;
+        let index = serde_json::from_slice::<CacheIndex>(&data)?;
+        Ok(Some(index))
+    }
+
+    fn upsert_candidate(&self, date: &str, candidate: WallpaperCandidate) -> Result<()> {
+        let mut index = self.load_index(date)?.unwrap_or_else(|| CacheIndex {
+            date: date.to_string(),
+            candidates: Vec::new(),
+        });
+        if let Some(existing) = index
+            .candidates
+            .iter_mut()
+            .find(|item| item.id == candidate.id)
+        {
+            *existing = candidate;
+        } else {
+            index.candidates.push(candidate);
+        }
+        self.write_index(date, &index)
+    }
+
+    fn write_index(&self, date: &str, index: &CacheIndex) -> Result<()> {
+        let path = self.index_path(date);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let bytes = serde_json::to_vec_pretty(index)?;
+        write_bytes_atomic(&path, &bytes)?;
+        Ok(())
+    }
+
+    fn find_candidate(
+        &self,
+        date: &str,
+        source: WallpaperSource,
+    ) -> Result<Option<WallpaperCandidate>> {
+        let index = match self.load_index(date)? {
+            Some(idx) => idx,
+            None => return Ok(None),
+        };
+        Ok(index
+            .candidates
+            .into_iter()
+            .find(|cand| cand.source == source))
+    }
+
+    fn write_last_applied(&self, data: &LastApplied) -> Result<()> {
+        if let Some(parent) = self.last_applied_path().parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let bytes = serde_json::to_vec_pretty(data)?;
+        write_bytes_atomic(&self.last_applied_path(), &bytes)?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    fn read_last_applied(&self) -> Result<Option<LastApplied>> {
+        let path = self.last_applied_path();
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = fs::read(path)?;
+        let value = serde_json::from_slice(&bytes)?;
+        Ok(Some(value))
+    }
+}
+
 #[derive(Debug, Clone, ValueEnum)]
 enum CommandArg {
     EnableAutoUpdate,
     DisableAutoUpdate,
     Info,
+    Choose,
 }
 
 #[derive(Debug, Parser)]
@@ -192,6 +325,9 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
         bing_host: "www.bing.com".to_string(),
     };
 
+    let cache = CacheManager::new(&settings.picture_dir);
+    let target_date = target_date_for_day(settings.day);
+    let date_label = target_date.to_string();
     let client = build_client()?;
 
     match args.command {
@@ -209,31 +345,78 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
             show_info(&settings.picture_dir)?;
             return Ok(());
         }
+        Some(CommandArg::Choose) => {
+            log(
+                "Choose mode will show an interactive list in a future phase; using Bing for now.",
+                settings.quiet,
+            );
+        }
         None => {}
     }
 
     ensure_picture_dir(&settings.picture_dir)?;
 
+    if !settings.force {
+        if let Some(candidate) = cache.find_candidate(&date_label, WallpaperSource::Bing)? {
+            if candidate.local_path.exists() {
+                log(
+                    &format!(
+                        "Using cached wallpaper for {} from {:?}",
+                        date_label, candidate.source
+                    ),
+                    settings.quiet,
+                );
+                ensure_info_file(&settings.picture_dir, &candidate)?;
+                apply_wallpaper(
+                    &candidate.local_path,
+                    &settings,
+                    &cache,
+                    &candidate.id,
+                    candidate.source,
+                )?;
+                return Ok(());
+            }
+        }
+    }
+
     let archive_url = build_archive_url(settings.day, settings.country.as_deref());
     let (url_base, metadata_body) = fetch_image_metadata(&client, &archive_url)?;
+    let metadata = parse_bing_metadata(&metadata_body)?;
 
     let mut last_error: Option<WallpaperError> = None;
     for res in resolutions {
         match download_image(&client, &url_base, &res, &settings, &metadata_body) {
-            Ok((file_path, skipped)) => {
-                let result = if settings.experimental {
-                    if skipped {
-                        log(
-                            "Download skipped; experimental all-desktops update not applied.",
-                            settings.quiet,
-                        );
-                        Ok(())
-                    } else {
-                        set_wallpaper_experimental(&file_path, settings.quiet)
-                    }
-                } else {
-                    set_wallpaper(&file_path, settings.monitor, settings.quiet)
+            Ok(downloaded) => {
+                let candidate = WallpaperCandidate {
+                    id: format!("bing-{date_label}-{res}"),
+                    source: WallpaperSource::Bing,
+                    title: metadata.headline.clone(),
+                    description: None,
+                    attribution: metadata.copyright.clone(),
+                    info_url: metadata.copyright_link.clone(),
+                    image_url: downloaded.image_url.clone(),
+                    local_path: downloaded.path.clone(),
+                    date: date_label.clone(),
+                    metadata_xml: Some(String::from_utf8_lossy(&metadata_body).to_string()),
                 };
+
+                if settings.experimental && downloaded.skipped {
+                    log(
+                        "Download skipped; experimental all-desktops update not applied.",
+                        settings.quiet,
+                    );
+                    cache.upsert_candidate(&date_label, candidate)?;
+                    return Ok(());
+                }
+
+                let result = apply_wallpaper(
+                    &downloaded.path,
+                    &settings,
+                    &cache,
+                    &candidate.id,
+                    candidate.source,
+                );
+                cache.upsert_candidate(&date_label, candidate)?;
 
                 if let Err(err) = result {
                     last_error = Some(err);
@@ -306,6 +489,12 @@ fn log(message: &str, quiet: bool) {
     println!("{timestamp}: {message}");
 }
 
+fn target_date_for_day(day: i32) -> NaiveDate {
+    let today = Local::now().date_naive();
+    let delta = ChronoDuration::days(day.into());
+    today.checked_sub_signed(delta).unwrap_or(today)
+}
+
 fn build_archive_url(day: i32, country: Option<&str>) -> String {
     let mut serializer = form_urlencoded::Serializer::new(String::new());
     serializer.append_pair("format", "xml");
@@ -331,6 +520,38 @@ fn fetch_image_metadata(client: &Client, archive_url: &str) -> Result<(String, V
     let body = response.bytes()?.to_vec();
     let url_base = parse_xml_text(&body, "urlBase")?.ok_or(WallpaperError::MissingImageUrl)?;
     Ok((url_base, body))
+}
+
+#[derive(Debug, Default, Clone)]
+struct BingMetadata {
+    headline: Option<String>,
+    copyright: Option<String>,
+    copyright_link: Option<String>,
+}
+
+fn parse_bing_metadata(body: &[u8]) -> Result<BingMetadata> {
+    let text = std::str::from_utf8(body).map_err(|_| WallpaperError::MetadataParse)?;
+    let doc = roxmltree::Document::parse(text).map_err(|_| WallpaperError::MetadataParse)?;
+    let headline = doc
+        .descendants()
+        .find(|n| n.has_tag_name("headline"))
+        .and_then(|n| n.text())
+        .map(|t| t.to_string());
+    let copyright = doc
+        .descendants()
+        .find(|n| n.has_tag_name("copyright"))
+        .and_then(|n| n.text())
+        .map(|t| t.to_string());
+    let copyright_link = doc
+        .descendants()
+        .find(|n| n.has_tag_name("copyrightlink"))
+        .and_then(|n| n.text())
+        .map(|t| t.to_string());
+    Ok(BingMetadata {
+        headline,
+        copyright,
+        copyright_link,
+    })
 }
 
 fn parse_xml_text(body: &[u8], tag: &str) -> Result<Option<String>> {
@@ -361,13 +582,20 @@ fn sanitize_filename(name: &str) -> String {
     }
 }
 
+#[derive(Debug)]
+struct DownloadedImage {
+    path: PathBuf,
+    skipped: bool,
+    image_url: String,
+}
+
 fn download_image(
     client: &Client,
     url_base: &str,
     resolution: &str,
     settings: &Settings,
     metadata_body: &[u8],
-) -> Result<(PathBuf, bool)> {
+) -> Result<DownloadedImage> {
     let file_url_with_res = format!("{url_base}_{resolution}.jpg");
     let file_url = format!(
         "{}://{}/{}",
@@ -393,7 +621,11 @@ fn download_image(
             &format!("Skipping download, already present: {name}"),
             settings.quiet,
         );
-        return Ok((target_path, true));
+        return Ok(DownloadedImage {
+            path: target_path,
+            skipped: true,
+            image_url: file_url,
+        });
     }
 
     log(
@@ -457,7 +689,11 @@ fn download_image(
         return Err(err);
     }
 
-    Ok((target_path, false))
+    Ok(DownloadedImage {
+        path: target_path,
+        skipped: false,
+        image_url: file_url,
+    })
 }
 
 fn unique_temp_path(target_path: &Path) -> PathBuf {
@@ -492,6 +728,46 @@ fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Err(err) = write_result {
         let _ = fs::remove_file(&temp_path);
         return Err(err);
+    }
+    Ok(())
+}
+
+fn apply_wallpaper(
+    file_path: &Path,
+    settings: &Settings,
+    cache: &CacheManager,
+    candidate_id: &str,
+    source: WallpaperSource,
+) -> Result<()> {
+    let result = if settings.experimental {
+        set_wallpaper_experimental(file_path, settings.quiet)
+    } else {
+        set_wallpaper(file_path, settings.monitor, settings.quiet)
+    };
+
+    if result.is_ok() {
+        let applied = LastApplied {
+            candidate_id: candidate_id.to_string(),
+            source,
+            applied_path: file_path.to_path_buf(),
+            applied_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        };
+        cache.write_last_applied(&applied)?;
+    }
+
+    result
+}
+
+fn ensure_info_file(picture_dir: &Path, candidate: &WallpaperCandidate) -> Result<()> {
+    let info_path = picture_dir.join("info.xml");
+    if info_path.exists() {
+        return Ok(());
+    }
+    if let Some(xml) = &candidate.metadata_xml {
+        write_bytes_atomic(&info_path, xml.as_bytes())?;
     }
     Ok(())
 }
@@ -661,35 +937,25 @@ fn show_info(picture_dir: &Path) -> Result<()> {
     let mut body = Vec::new();
     File::open(&info_path)?.read_to_end(&mut body)?;
 
-    let root = roxmltree::Document::parse(
-        std::str::from_utf8(&body).map_err(|_| WallpaperError::MetadataParse)?,
-    )
-    .map_err(|_| WallpaperError::MetadataParse)?;
-    let headline = root
-        .descendants()
-        .find(|n| n.has_tag_name("headline"))
-        .and_then(|n| n.text())
-        .unwrap_or("");
-    let copyright_text = root
-        .descendants()
-        .find(|n| n.has_tag_name("copyright"))
-        .and_then(|n| n.text())
-        .unwrap_or("Unknown copyright");
-    let copyright_link = root
-        .descendants()
-        .find(|n| n.has_tag_name("copyrightlink"))
-        .and_then(|n| n.text())
-        .unwrap_or("");
+    let metadata = parse_bing_metadata(&body)?;
 
     let mut info = String::new();
-    if !headline.is_empty() {
-        info.push_str(headline);
-        info.push('\n');
+    if let Some(headline) = &metadata.headline {
+        if !headline.is_empty() {
+            info.push_str(headline);
+            info.push('\n');
+        }
     }
-    info.push_str(copyright_text);
-    if !copyright_link.is_empty() {
-        info.push('\n');
-        info.push_str(copyright_link);
+    if let Some(text) = &metadata.copyright {
+        info.push_str(text);
+    } else {
+        info.push_str("Unknown copyright");
+    }
+    if let Some(link) = &metadata.copyright_link {
+        if !link.is_empty() {
+            info.push('\n');
+            info.push_str(link);
+        }
     }
 
     println!("{info}");
@@ -795,9 +1061,9 @@ mod tests {
             then.status(200).body("image-bytes");
         });
 
-        let (path, skipped) = download_image(&client, url_base, res, &settings, metadata).unwrap();
-        assert!(skipped);
-        assert_eq!(path, target);
+        let downloaded = download_image(&client, url_base, res, &settings, metadata).unwrap();
+        assert!(downloaded.skipped);
+        assert_eq!(downloaded.path, target);
         assert_eq!(_mock.hits(), 0);
     }
 
@@ -824,10 +1090,10 @@ mod tests {
             then.status(200).body("image-bytes");
         });
 
-        let (path, skipped) = download_image(&client, url_base, res, &settings, metadata).unwrap();
-        assert!(!skipped);
-        assert!(path.exists());
-        assert_eq!(fs::read(&path).unwrap(), b"image-bytes");
+        let downloaded = download_image(&client, url_base, res, &settings, metadata).unwrap();
+        assert!(!downloaded.skipped);
+        assert!(downloaded.path.exists());
+        assert_eq!(fs::read(&downloaded.path).unwrap(), b"image-bytes");
         assert!(!old_wallpaper.exists());
         assert_eq!(fs::read(tmpdir.path().join("info.xml")).unwrap(), metadata);
         assert_eq!(_mock.hits(), 1);
@@ -876,5 +1142,58 @@ mod tests {
             .collect();
         assert!(temps.is_empty(), "Temporary files must be cleaned up");
         assert_eq!(_mock.hits(), 1);
+    }
+
+    #[test]
+    fn cache_manager_upserts_and_loads_candidate() {
+        let tmpdir = tempdir().unwrap();
+        let cache = CacheManager::new(tmpdir.path());
+        let candidate = WallpaperCandidate {
+            id: "bing-2024-01-01-1080".into(),
+            source: WallpaperSource::Bing,
+            title: Some("title".into()),
+            description: None,
+            attribution: Some("copyright".into()),
+            info_url: None,
+            image_url: "http://example".into(),
+            local_path: tmpdir.path().join("wallpaper.jpg"),
+            date: "2024-01-01".into(),
+            metadata_xml: Some("<xml>meta</xml>".into()),
+        };
+
+        cache
+            .upsert_candidate("2024-01-01", candidate.clone())
+            .unwrap();
+
+        let loaded = cache
+            .find_candidate("2024-01-01", WallpaperSource::Bing)
+            .unwrap()
+            .expect("candidate must exist");
+        assert_eq!(loaded.id, candidate.id);
+        assert_eq!(loaded.title, candidate.title);
+    }
+
+    #[test]
+    fn ensure_info_file_restores_missing_info() {
+        let tmpdir = tempdir().unwrap();
+        let candidate = WallpaperCandidate {
+            id: "bing-2024-01-02-uhd".into(),
+            source: WallpaperSource::Bing,
+            title: None,
+            description: None,
+            attribution: None,
+            info_url: None,
+            image_url: "http://example".into(),
+            local_path: tmpdir.path().join("wallpaper2.jpg"),
+            date: "2024-01-02".into(),
+            metadata_xml: Some("<xml>info</xml>".into()),
+        };
+
+        let info_path = tmpdir.path().join("info.xml");
+        assert!(!info_path.exists());
+        ensure_info_file(tmpdir.path(), &candidate).unwrap();
+        assert!(info_path.exists());
+        let contents = fs::read_to_string(info_path).unwrap();
+        assert!(contents.contains("info"));
     }
 }

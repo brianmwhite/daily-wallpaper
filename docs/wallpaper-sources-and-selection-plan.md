@@ -27,6 +27,7 @@ Non-goals (initially):
 ### Keep current behavior
 
 - Running `bing-wallpaper-daily-mac-multimonitor` without extra args continues to fetch Bing and set it (using cache if same day).
+- Decision: go with **Option A** (`choose` subcommand). Until the interactive list is built (Phase 4), it will behave like the default download/apply flow.
 
 ### New: interactive selection
 
@@ -248,6 +249,13 @@ Deliverable:
   - fallback to Bing automatically vs error out when `--source apod` is explicit
 - Do we want automatic cache pruning (e.g. keep last N days)? If yes, implement with `trash` and make it opt-in.
 
+Decisions made after follow-up:
+- Use **Option A** (`choose` subcommand).
+- No video support (APOD video days are skipped/errored).
+- Keep 5 options fixed initially.
+- Bing and APOD respect `--day`; Spotlight ignores `--day` (treats as “today feed”).
+- Cache pruning should be opt-in and use the `trash` command.
+
 ## Suggested Acceptance Criteria
 
 - Running with no args behaves exactly like before (Bing daily wallpaper, cached per day).
@@ -260,4 +268,3 @@ Deliverable:
   - spotlight JSON parsing for 3 candidates
   - apod parsing for image/video
   - “uses cache when present” behavior
-
