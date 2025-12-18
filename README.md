@@ -64,6 +64,7 @@ bing-wallpaper-daily-mac-multimonitor info
   --nasa-api-key <key>           NASA API key for APOD (default: DEMO_KEY or NASA_API_KEY env).
   --apod-hd                      Prefer the APOD HD image when available.
   --no-apod-crop                 Disable APOD center-crop/resize to monitor aspect ratio (default: enabled).
+  --prune-cache-days <n>         After a successful run, delete cached days older than <n> days.
   --auto-update-name <name>      Name for the auto-update job (default: default).
   -f --force                     Force download even if the file already exists.
   -s --ssl                       Communicate with bing.com over HTTPS (default; use --no-ssl to opt out).
@@ -92,6 +93,7 @@ bing-wallpaper-daily-mac-multimonitor info
 - Spotlight ignores `--day` and always fetches the current feed; Bing respects `--day`. Same-day reruns reuse cached files unless `--force` is given.
 - APOD respects `--day`, skips non-image media, defaults to the NASA DEMO_KEY (supply your own key or set `NASA_API_KEY` to avoid rate limits), and center-crops/resizes to your primary display’s aspect ratio by default (disable with `--no-apod-crop`).
 - `choose` downloads/caches today’s Bing, Spotlight, and APOD candidates (if available), shows a list you can navigate with arrows, lets you preview with Quick Look, refresh, or apply.
+- Use `--prune-cache-days <n>` to delete cached days older than `<n>` after a successful run.
 
 ## Development and tests
 

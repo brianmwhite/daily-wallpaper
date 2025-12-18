@@ -112,6 +112,7 @@ struct Settings {
     apod_hd: bool,
     apod_url_override: Option<String>,
     apod_crop: bool,
+    prune_cache_days: Option<u32>,
 }
 
 impl Settings {
@@ -326,6 +327,13 @@ struct Cli {
     )]
     apod_crop: bool,
 
+    #[arg(
+        long = "prune-cache-days",
+        value_parser = clap::value_parser!(u32).range(1..=365),
+        help = "Remove cached wallpaper days older than this many days (uses `trash`)"
+    )]
+    prune_cache_days: Option<u32>,
+
     #[arg(short = 's', long = "ssl", default_value_t = true, action = ArgAction::SetTrue)]
     ssl: bool,
 
@@ -435,6 +443,7 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
         apod_hd: args.apod_hd,
         apod_url_override: None,
         apod_crop: args.apod_crop,
+        prune_cache_days: args.prune_cache_days,
     };
 
     let cache = CacheManager::new(&settings.picture_dir);
@@ -470,7 +479,7 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
 
     ensure_picture_dir(&settings.picture_dir)?;
 
-    match settings.source {
+    let result = match settings.source {
         WallpaperSource::Bing => run_bing(&client, &cache, &settings, &date_label, resolutions),
         WallpaperSource::Spotlight => run_spotlight(
             &client,
@@ -480,7 +489,15 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
             settings.spotlight_index,
         ),
         WallpaperSource::Apod => run_apod(&client, &cache, &settings, &date_label),
+    };
+
+    if result.is_ok() {
+        if let Some(days) = settings.prune_cache_days {
+            prune_cache(&cache, days, settings.quiet)?;
+        }
     }
+
+    result
 }
 
 fn build_client() -> Result<Client> {
@@ -1490,6 +1507,47 @@ fn parse_resolution(res_str: &str) -> Option<(u32, u32)> {
     Some((w, h))
 }
 
+fn prune_cache(cache: &CacheManager, keep_days: u32, quiet: bool) -> Result<()> {
+    let cache_root = &cache.base_dir;
+    if !cache_root.exists() {
+        return Ok(());
+    }
+
+    let today = Local::now().date_naive();
+    let cutoff = today
+        .checked_sub_signed(ChronoDuration::days((keep_days.saturating_sub(1)) as i64))
+        .unwrap_or(today);
+
+    for entry in fs::read_dir(cache_root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(folder_name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let Ok(date) = NaiveDate::parse_from_str(folder_name, "%Y-%m-%d") else {
+            continue;
+        };
+        if date < cutoff {
+            log(
+                &format!(
+                    "Pruning cache entry {} (older than {} days)",
+                    path.display(),
+                    keep_days
+                ),
+                quiet,
+            );
+            if let Err(err) = fs::remove_dir_all(&path) {
+                log(&format!("Failed to prune {}: {err}", path.display()), quiet);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn apply_wallpaper(
     file_path: &Path,
     settings: &Settings,
@@ -1775,6 +1833,7 @@ mod tests {
             apod_hd: false,
             apod_url_override: None,
             apod_crop: true,
+            prune_cache_days: None,
         }
     }
 
