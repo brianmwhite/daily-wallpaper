@@ -330,28 +330,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bing-wallpaper-daily-mac-multimonitor"
-version = "1.4.0"
-dependencies = [
- "chrono",
- "clap",
- "httpmock",
- "image",
- "indicatif",
- "inquire",
- "plist",
- "reqwest",
- "roxmltree",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 1.0.69",
- "toml",
- "url",
-]
-
-[[package]]
 name = "bit-set"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2637,6 +2615,28 @@ checksum = "29790946404f91d9c5d06f9874efddea1dc06c5efe94541a7d6863108e3a5e4b"
 dependencies = [
  "same-file",
  "winapi-util",
+]
+
+[[package]]
+name = "wallpaper-daily-mac-multimonitor"
+version = "2.0.0"
+dependencies = [
+ "chrono",
+ "clap",
+ "httpmock",
+ "image",
+ "indicatif",
+ "inquire",
+ "plist",
+ "reqwest",
+ "roxmltree",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "toml",
+ "url",
 ]
 
 [[package]]

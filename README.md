@@ -1,6 +1,6 @@
 # Rust CLI to download and set the Bing Daily Wallpaper on macOS
 
-This project now ships as a Rust CLI. It downloads wallpapers to `~/Pictures/bing-wallpapers/` and sets them across all desktops or a specific monitor on macOS. Sources supported today:
+This project now ships as a Rust CLI. It downloads wallpapers to `~/Pictures/daily-wallpapers/` and sets them across all desktops or a specific monitor on macOS. Sources supported today:
 - Bing Daily (default)
 - Windows Spotlight (3 images per day; choose with `--spotlight-index`)
 - NASA APOD (images only; use `--apod-hd` to prefer the HD URL)
@@ -73,7 +73,7 @@ bing-wallpaper-daily-mac-multimonitor info
   -c --country <country-code>    Market/region code (en-US, cs-CZ, ...).
   -d --day <number>              Day offset (0=today, 1=yesterday...). Default: 0.
   -n --filename <file name>      Custom filename for the downloaded picture.
-  -p --picturedir <picture dir>  Download directory [default: ~/Pictures/bing-wallpapers/].
+  -p --picturedir <picture dir>  Download directory [default: ~/Pictures/daily-wallpapers/].
   -r --resolution <resolution>   Single resolution to try.
   --resolutions <resolutions>    List of resolutions to try (e.g. --resolutions 1920x1200 UHD).
   -m --monitor <num>             Apply wallpaper only to a specific monitor (1,2,3...).
@@ -88,7 +88,7 @@ bing-wallpaper-daily-mac-multimonitor info
 - Default resolutions are tried in order: `1920x1200`, `1920x1080`, `1024x768`, `1280x720`, `1366x768`, `UHD`.
 - Use `--auto-update-name` to run multiple schedules (different monitors, days, or countries).
 - The experimental `--all-desktops-experimental` flag writes to `~/Library/Application Support/Dock/desktoppicture.db`. If something breaks, delete that file and restart the Dock.
-- Wallpapers and `info.xml` are saved under `~/Pictures/bing-wallpapers/` unless overridden with `--picturedir`.
+- Wallpapers and `info.xml` are saved under `~/Pictures/daily-wallpapers/` unless overridden with `--picturedir`.
 - For local development without installing, run `./run.sh ...` (calls `cargo run --`).
 - Spotlight ignores `--day` and always fetches the current feed; Bing respects `--day`. Same-day reruns reuse cached files unless `--force` is given.
 - APOD respects `--day`, skips non-image media, defaults to the NASA DEMO_KEY (supply your own key or set `NASA_API_KEY` to avoid rate limits), and center-crops/resizes to your primary display’s aspect ratio by default (disable with `--no-apod-crop`).
@@ -110,7 +110,7 @@ bing-wallpaper-daily-mac-multimonitor info
   prune_cache_days = 14
 
   # Default download directory
-  picture_dir = "~/Pictures/bing-wallpapers"
+  picture_dir = "~/Pictures/daily-wallpapers"
 
   # Verbosity: quiet | normal | verbose
   verbosity = "normal"
@@ -141,7 +141,7 @@ bing-wallpaper-daily-mac-multimonitor info
   cargo test
   ```
 ## Future Ideas
-- Retrieve spotlight images using https://fd.api.iris.microsoft.com/v4/api/selection?&placement=88000820&bcnt=4&country=US&locale=en-US&fmt=json. Ref https://github.com/ORelio/Spotlight-Downloader/blob/master/SpotlightAPI.md
-- Retrieve NASA 
-https://apod.nasa.gov/apod/astropix.html
-https://api.nasa.gov/planetary/apod?api_key=DEMO_KEY
+- rename project, github repo, update authors, add attribution, license?
+- add instructions on new sources, evaluate refactoring more generic
+
+- test auto apply

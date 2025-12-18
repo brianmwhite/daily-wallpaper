@@ -1,6 +1,5 @@
 use chrono::{Duration as ChronoDuration, Local, NaiveDate};
 use clap::{ArgAction, Parser, ValueEnum};
-use indicatif::{ProgressBar, ProgressStyle};
 use inquire::{InquireError, Select};
 use plist::{Dictionary, Value};
 use reqwest::blocking::Client;
@@ -32,12 +31,12 @@ const DEFAULT_RESOLUTIONS: &[&str] = &[
 ];
 const DEFAULT_PATH: &str = "/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin";
 const USER_AGENT: &str = concat!(
-    "bing-wallpaper-daily-mac-multimonitor/",
+    "wallpaper-daily-mac-multimonitor/",
     env!("CARGO_PKG_VERSION")
 );
 const METADATA_TIMEOUT: Duration = Duration::from_secs(30);
 const IMAGE_TIMEOUT: Duration = Duration::from_secs(60);
-const PLIST_BASENAME: &str = "com.bing-wallpaper-daily-mac-multimonitor";
+const PLIST_BASENAME: &str = "com.thirdember.wallpaper-daily-mac-multimonitor";
 const CACHE_DIR_NAME: &str = "cache";
 const CACHE_INDEX_FILE: &str = "index.json";
 const LAST_APPLIED_FILE: &str = "last_applied.json";
@@ -348,9 +347,9 @@ fn map_source(source: SourceArg) -> WallpaperSource {
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "bing-wallpaper-daily-mac-multimonitor",
+    name = "wallpaper-daily-mac-multimonitor",
     version,
-    about = "Download the Bing daily wallpaper and apply it to macOS desktops."
+    about = "Download the daily wallpapers and apply one to macOS desktops."
 )]
 struct Cli {
     #[arg(value_enum)]
@@ -433,7 +432,7 @@ pub fn run_from_env() -> Result<()> {
 }
 
 fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
-    let mut clap_args = vec![OsString::from("bing-wallpaper-daily-mac-multimonitor")];
+    let mut clap_args = vec![OsString::from("wallpaper-daily-mac-multimonitor")];
     clap_args.extend(raw_args.iter().map(OsString::from));
     let args = Cli::parse_from(clap_args);
     let config = load_config();
@@ -699,7 +698,7 @@ fn build_client() -> Result<Client> {
 }
 
 fn default_picture_dir() -> PathBuf {
-    home_dir().join("Pictures").join("bing-wallpapers")
+    home_dir().join("Pictures").join("daily-wallpapers")
 }
 
 fn home_dir() -> PathBuf {
@@ -757,11 +756,16 @@ fn log_verbose(message: &str, settings: &Settings) {
     log(message, false);
 }
 
-fn start_spinner(settings: &Settings, message: impl Into<String>) -> Option<ProgressBar> {
+fn start_spinner(
+    settings: &Settings,
+    message: impl Into<String>,
+) -> Option<indicatif::ProgressBar> {
+    use indicatif::ProgressStyle;
+
     if settings.verbose || settings.quiet {
         return None;
     }
-    let pb = ProgressBar::new_spinner();
+    let pb = indicatif::ProgressBar::new_spinner();
     pb.set_style(
         ProgressStyle::with_template("{spinner} {msg}")
             .unwrap_or_else(|_| ProgressStyle::default_spinner()),
@@ -772,7 +776,7 @@ fn start_spinner(settings: &Settings, message: impl Into<String>) -> Option<Prog
 }
 
 fn finish_spinner(
-    spinner: Option<ProgressBar>,
+    spinner: Option<indicatif::ProgressBar>,
     message: &str,
     settings: &Settings,
     clear_only: bool,

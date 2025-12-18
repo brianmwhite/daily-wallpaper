@@ -19,7 +19,7 @@ Non-goals (initially):
 ## Current State (Baseline)
 
 - `src/lib.rs` implements: Bing metadata fetch, image download, wallpaper apply (AppleScript / optional Dock DB update), `launchd` plist enable/disable, and `info` output.
-- Images and `info.xml` are saved under `~/Pictures/bing-wallpapers/` (or `--picturedir`).
+- Images and `info.xml` are saved under `~/Pictures/daily-wallpapers/` (or `--picturedir`).
 - The tool already has `--force` and robust atomic writes.
 
 ## Proposed UX / CLI
