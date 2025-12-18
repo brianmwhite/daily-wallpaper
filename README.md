@@ -189,4 +189,3 @@ cargo test
 ```
 
 ## Future ideas / TODOs
-- Test auto-apply flows.
