@@ -1,6 +1,7 @@
 use chrono::{Duration as ChronoDuration, Local, NaiveDate};
 use clap::{ArgAction, Parser, ValueEnum};
 use inquire::Select;
+use indicatif::{ProgressBar, ProgressStyle};
 use plist::{Dictionary, Value};
 use reqwest::blocking::Client;
 use reqwest::StatusCode;
@@ -96,6 +97,7 @@ struct Settings {
     auto_update_name: String,
     monitor: usize,
     force: bool,
+    verbose: bool,
     quiet: bool,
     experimental: bool,
     filename: Option<String>,
@@ -334,6 +336,9 @@ struct Cli {
     #[arg(short = 'q', long = "quiet", action = ArgAction::SetTrue)]
     quiet: bool,
 
+    #[arg(short = 'v', long = "verbose", action = ArgAction::SetTrue, conflicts_with = "quiet")]
+    verbose: bool,
+
     #[arg(short = 'c', long = "country")]
     country: Option<String>,
 
@@ -419,6 +424,7 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
         auto_update_name: normalize_auto_update_name(&args.auto_update_name),
         monitor: args.monitor,
         force: args.force,
+        verbose: args.verbose,
         quiet: args.quiet,
         experimental: args.all_desktops_experimental,
         filename: args.filename.clone(),
@@ -532,6 +538,46 @@ fn log(message: &str, quiet: bool) {
     }
     let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
     println!("{timestamp}: {message}");
+}
+
+fn log_verbose(message: &str, settings: &Settings) {
+    if settings.quiet || !settings.verbose {
+        return;
+    }
+    log(message, false);
+}
+
+fn start_spinner(settings: &Settings, message: impl Into<String>) -> Option<ProgressBar> {
+    if settings.verbose || settings.quiet {
+        return None;
+    }
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::with_template("{spinner} {msg}")
+            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+    );
+    pb.set_message(message.into());
+    pb.enable_steady_tick(Duration::from_millis(120));
+    Some(pb)
+}
+
+fn finish_spinner(
+    spinner: Option<ProgressBar>,
+    message: &str,
+    settings: &Settings,
+    clear_only: bool,
+) {
+    if let Some(pb) = spinner {
+        if clear_only {
+            pb.finish_and_clear();
+        } else if settings.verbose {
+            pb.finish_with_message(message.to_string());
+        } else {
+            pb.finish_and_clear();
+        }
+    } else if settings.verbose && !settings.quiet && !clear_only {
+        log(message, false);
+    }
 }
 
 fn target_date_for_day(day: i32) -> NaiveDate {
@@ -738,16 +784,15 @@ fn download_to_path(
     client: &Client,
     url: &str,
     target_path: &Path,
-    force: bool,
-    quiet: bool,
+    settings: &Settings,
 ) -> Result<DownloadedFile> {
-    if target_path.exists() && !force {
-        log(
+    if target_path.exists() && !settings.force {
+        log_verbose(
             &format!(
                 "Skipping download, already present: {}",
                 target_path.display()
             ),
-            quiet,
+            settings,
         );
         return Ok(DownloadedFile {
             path: target_path.to_path_buf(),
@@ -758,7 +803,8 @@ fn download_to_path(
         fs::create_dir_all(parent)?;
     }
 
-    log(&format!("Downloading {}", url), quiet);
+    log_verbose(&format!("Downloading {}", url), settings);
+    let spinner = start_spinner(settings, format!("Downloading {}", url));
     let temp_path = unique_temp_path(target_path);
     let download_result = (|| -> Result<()> {
         let _ = fs::remove_file(&temp_path);
@@ -774,8 +820,16 @@ fn download_to_path(
 
     if let Err(err) = download_result {
         let _ = fs::remove_file(&temp_path);
+        finish_spinner(spinner, "", settings, true);
         return Err(err);
     }
+
+    finish_spinner(
+        spinner,
+        &format!("Downloaded {}", target_path.display()),
+        settings,
+        false,
+    );
 
     Ok(DownloadedFile {
         path: target_path.to_path_buf(),
@@ -1175,6 +1229,7 @@ mod tests {
             auto_update_name: "default".into(),
             monitor: 0,
             force,
+            verbose: false,
             quiet: true,
             experimental: false,
             filename: filename.map(ToString::to_string),

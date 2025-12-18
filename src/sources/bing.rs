@@ -1,7 +1,7 @@
 use crate::{
-    ensure_http_success, ensure_info_file, log, write_bytes_atomic, CacheManager, Result, Settings,
-    WallpaperCandidate, WallpaperError, WallpaperSource, DEFAULT_RESOLUTIONS, IMAGE_TIMEOUT,
-    METADATA_TIMEOUT,
+    ensure_http_success, ensure_info_file, finish_spinner, log, log_verbose, start_spinner,
+    write_bytes_atomic, CacheManager, Result, Settings, WallpaperCandidate, WallpaperError,
+    WallpaperSource, DEFAULT_RESOLUTIONS, IMAGE_TIMEOUT, METADATA_TIMEOUT,
 };
 use reqwest::blocking::Client;
 use roxmltree;
@@ -75,12 +75,12 @@ pub(crate) fn fetch_bing_candidate(
     if !settings.force {
         if let Some(candidate) = cache.find_candidate(date_label, WallpaperSource::Bing)? {
             if candidate.local_path.exists() {
-                log(
+                log_verbose(
                     &format!(
                         "Using cached wallpaper for {} from {:?}",
                         date_label, candidate.source
                     ),
-                    settings.quiet,
+                    settings,
                 );
                 ensure_info_file(&settings.picture_dir, &candidate)?;
                 return Ok(FetchedCandidate {
@@ -92,6 +92,10 @@ pub(crate) fn fetch_bing_candidate(
     }
 
     let archive_url = build_archive_url(settings.day, settings.country.as_deref());
+    log_verbose(
+        &format!("Fetching Bing metadata: {}", archive_url),
+        settings,
+    );
     let (url_base, metadata_body) = fetch_image_metadata(client, &archive_url)?;
     let metadata = parse_bing_metadata(&metadata_body)?;
 
@@ -236,6 +240,10 @@ pub(crate) fn download_image(
         settings.bing_host,
         file_url_with_res.trim_start_matches('/')
     );
+    log_verbose(
+        &format!("Bing image URL ({}): {}", resolution, file_url),
+        settings,
+    );
 
     let filename_local = if let Some(name) = &settings.filename {
         sanitize_filename(name)
@@ -250,9 +258,9 @@ pub(crate) fn download_image(
             .file_name()
             .map(|n| n.to_string_lossy())
             .unwrap_or_else(|| target_path.to_string_lossy());
-        log(
+        log_verbose(
             &format!("Skipping download, already present: {name}"),
-            settings.quiet,
+            settings,
         );
         return Ok(DownloadedImage {
             path: target_path,
@@ -261,9 +269,13 @@ pub(crate) fn download_image(
         });
     }
 
-    log(
+    log_verbose(
         &format!("Downloading {resolution} from {file_url}"),
-        settings.quiet,
+        settings,
+    );
+    let spinner = start_spinner(
+        settings,
+        format!("Downloading Bing {resolution} wallpaper…"),
     );
 
     let temp_path = crate::unique_temp_path(&target_path);
@@ -319,8 +331,16 @@ pub(crate) fn download_image(
 
     if let Err(err) = download_result {
         let _ = fs::remove_file(&temp_path);
+        finish_spinner(spinner, "", settings, true);
         return Err(err);
     }
+
+    finish_spinner(
+        spinner,
+        &format!("Downloaded Bing {resolution} wallpaper"),
+        settings,
+        false,
+    );
 
     Ok(DownloadedImage {
         path: target_path,

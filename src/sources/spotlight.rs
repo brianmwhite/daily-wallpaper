@@ -1,6 +1,6 @@
 use crate::{
-    download_to_path, ensure_http_success, CacheManager, Result, Settings, WallpaperCandidate,
-    WallpaperError, WallpaperSource, METADATA_TIMEOUT,
+    download_to_path, ensure_http_success, log_verbose, CacheManager, Result, Settings,
+    WallpaperCandidate, WallpaperError, WallpaperSource, METADATA_TIMEOUT,
 };
 use reqwest::blocking::Client;
 use serde::Deserialize;
@@ -128,6 +128,10 @@ pub(crate) fn fetch_spotlight_candidates(
     }
 
     let url = build_spotlight_url(settings);
+    log_verbose(
+        &format!("Fetching Spotlight feed: {}", url),
+        settings,
+    );
     let response = client.get(url.clone()).timeout(METADATA_TIMEOUT).send()?;
     ensure_http_success(response.status(), &url)?;
     let body = response.bytes()?.to_vec();
@@ -155,8 +159,7 @@ pub(crate) fn fetch_spotlight_candidates(
             client,
             &asset_url,
             &local_path,
-            settings.force,
-            settings.quiet,
+            settings,
         )?;
 
         let candidate_id = format!("spotlight-{date_label}-{ordinal}");

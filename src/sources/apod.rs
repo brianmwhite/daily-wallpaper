@@ -1,6 +1,7 @@
 use crate::{
-    download_to_path, ensure_http_success, log, unique_temp_path, CacheManager, Result, Settings,
-    WallpaperCandidate, WallpaperError, WallpaperSource, METADATA_TIMEOUT,
+    download_to_path, ensure_http_success, finish_spinner, log, log_verbose, start_spinner,
+    unique_temp_path, CacheManager, Result, Settings, WallpaperCandidate, WallpaperError,
+    WallpaperSource, METADATA_TIMEOUT,
 };
 use image::imageops::FilterType;
 use image::{GenericImageView, ImageFormat};
@@ -72,9 +73,9 @@ pub(crate) fn fetch_apod_candidate(
     if !settings.force {
         if let Some(candidate) = cache.find_candidate_by_id(date_label, &candidate_id)? {
             if candidate.local_path.exists() {
-                log(
+                log_verbose(
                     &format!("Using cached APOD wallpaper for {}", date_label),
-                    settings.quiet,
+                    settings,
                 );
                 return Ok(candidate);
             }
@@ -103,8 +104,7 @@ pub(crate) fn fetch_apod_candidate(
         client,
         &image_url,
         &target_path,
-        settings.force,
-        settings.quiet,
+        settings,
     )?;
 
     let candidate = WallpaperCandidate {
@@ -119,13 +119,24 @@ pub(crate) fn fetch_apod_candidate(
         date: date_label.to_string(),
         metadata_xml: None,
     };
+    log_verbose(
+        &format!("APOD image URL: {}", candidate.image_url),
+        settings,
+    );
     if settings.apod_crop {
-        if let Err(err) = crop_and_resize_apod(&candidate.local_path) {
-            log(
-                &format!("APOD crop/resize failed; using original image. {err}"),
-                settings.quiet,
-            );
+        let spinner = start_spinner(settings, "Processing APOD image…");
+        match crop_and_resize_apod(&candidate.local_path) {
+            Ok(()) => finish_spinner(spinner, "Processed APOD image", settings, false),
+            Err(err) => {
+                finish_spinner(spinner, "", settings, true);
+                log(
+                    &format!("APOD crop/resize failed; using original image. {err}"),
+                    settings.quiet,
+                );
+            }
         }
+    } else {
+        log_verbose("APOD cropping disabled; using original image.", settings);
     }
 
     cache.upsert_candidate(date_label, candidate.clone())?;
@@ -138,6 +149,7 @@ fn fetch_apod(client: &Client, settings: &Settings, date_label: &str) -> Result<
     serializer.append_pair("date", date_label);
     let base = settings.apod_url_override.as_deref().unwrap_or(APOD_URL);
     let url = format!("{base}?{}", serializer.finish());
+    log_verbose(&format!("Fetching APOD metadata: {}", url), settings);
     let response = client.get(&url).timeout(METADATA_TIMEOUT).send()?;
     ensure_http_success(response.status(), &url)?;
     let body = response.bytes()?.to_vec();
