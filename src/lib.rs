@@ -10,7 +10,7 @@ use serde_json;
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -215,6 +215,8 @@ struct LastApplied {
     source: WallpaperSource,
     applied_path: PathBuf,
     applied_at: u64,
+    #[serde(default)]
+    date: Option<String>,
 }
 
 struct CacheManager {
@@ -298,6 +300,32 @@ impl CacheManager {
             None => return Ok(None),
         };
         Ok(index.candidates.into_iter().find(|cand| cand.id == id))
+    }
+
+    fn find_candidate_any_date(&self, id: &str) -> Result<Option<WallpaperCandidate>> {
+        if !self.base_dir.exists() {
+            return Ok(None);
+        }
+
+        let mut dates: Vec<String> = Vec::new();
+        for entry in fs::read_dir(&self.base_dir)? {
+            let entry = entry?;
+            if !entry.path().is_dir() {
+                continue;
+            }
+            if let Some(name) = entry.file_name().to_str() {
+                dates.push(name.to_string());
+            }
+        }
+        dates.sort();
+
+        for date in dates {
+            if let Some(candidate) = self.find_candidate_by_id(&date, id)? {
+                return Ok(Some(candidate));
+            }
+        }
+
+        Ok(None)
     }
 
     fn write_last_applied(&self, data: &LastApplied) -> Result<()> {
@@ -653,7 +681,9 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
             return Ok(());
         }
         Some(CommandArg::Info) => {
-            show_info(&settings.picture_dir)?;
+            let stdout = io::stdout();
+            let mut handle = stdout.lock();
+            show_info(&cache, &mut handle)?;
             return Ok(());
         }
         Some(CommandArg::Choose) => {
@@ -830,6 +860,7 @@ fn run_source(source: &dyn Source, ctx: &SourceContext<'_>) -> Result<()> {
         ctx.cache,
         &candidate.id,
         candidate.source,
+        Some(&candidate.date),
     )
 }
 
@@ -946,6 +977,7 @@ fn run_choose(
                             cache,
                             &cand.id,
                             cand.source,
+                            Some(&cand.date),
                         ) {
                             Ok(()) => return Ok(()),
                             Err(err) => println!("Failed to apply wallpaper: {err}"),
@@ -1145,6 +1177,7 @@ fn apply_wallpaper(
     cache: &CacheManager,
     candidate_id: &str,
     source: WallpaperSource,
+    candidate_date: Option<&str>,
 ) -> Result<()> {
     let result = if settings.experimental {
         set_wallpaper_experimental(file_path, settings.quiet)
@@ -1161,6 +1194,7 @@ fn apply_wallpaper(
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
+            date: candidate_date.map(|d| d.to_string()),
         };
         cache.write_last_applied(&applied)?;
     }
@@ -1196,6 +1230,7 @@ fn reapply_last_wallpaper(cache: &CacheManager, settings: &Settings) -> Result<(
         cache,
         &last.candidate_id,
         last.source,
+        last.date.as_deref(),
     )
 }
 
@@ -1363,41 +1398,61 @@ fn remove_launchd_plist(settings: &Settings) -> Result<()> {
     Ok(())
 }
 
-fn show_info(picture_dir: &Path) -> Result<()> {
-    let info_path = picture_dir.join("info.xml");
-    if !info_path.exists() {
-        return Err(WallpaperError::Message(format!(
-            "No info.xml found in {}. Run the download first.",
-            picture_dir.display()
-        )));
-    }
-
-    let mut body = Vec::new();
-    File::open(&info_path)?.read_to_end(&mut body)?;
-
-    let metadata = crate::sources::bing::parse_bing_metadata(&body)?;
-
+fn format_candidate_info(candidate: &WallpaperCandidate) -> String {
     let mut info = String::new();
-    if let Some(headline) = &metadata.headline {
-        if !headline.is_empty() {
-            info.push_str(headline);
-            info.push('\n');
-        }
+    if let Some(title) = candidate.title.as_deref().filter(|t| !t.is_empty()) {
+        info.push_str(title);
+        info.push('\n');
     }
-    if let Some(text) = &metadata.copyright {
-        info.push_str(text);
+    if let Some(desc) = candidate
+        .description
+        .as_deref()
+        .filter(|d| !d.is_empty())
+    {
+        info.push_str(desc);
+        info.push('\n');
+    }
+    let attribution = candidate
+        .attribution
+        .as_deref()
+        .filter(|a| !a.is_empty())
+        .unwrap_or("Unknown copyright");
+    info.push_str(attribution);
+    if let Some(link) = candidate.info_url.as_deref().filter(|l| !l.is_empty()) {
+        info.push('\n');
+        info.push_str(link);
+    }
+    info
+}
+
+fn show_info<W: Write>(
+    cache: &CacheManager,
+    mut writer: W,
+) -> Result<()> {
+    let Some(last) = cache.read_last_applied()? else {
+        return Err(WallpaperError::Message(
+            "No previously applied wallpaper found. Run the download first.".to_string(),
+        ));
+    };
+
+    let candidate = if let Some(date) = last.date.as_deref() {
+        match cache.find_candidate_by_id(date, &last.candidate_id)? {
+            Some(found) => Some(found),
+            None => cache.find_candidate_any_date(&last.candidate_id)?,
+        }
     } else {
-        info.push_str("Unknown copyright");
-    }
-    if let Some(link) = &metadata.copyright_link {
-        if !link.is_empty() {
-            info.push('\n');
-            info.push_str(link);
-        }
+        cache.find_candidate_any_date(&last.candidate_id)?
+    };
+
+    if let Some(candidate) = candidate {
+        let info = format_candidate_info(&candidate);
+        writeln!(writer, "{info}")?;
+        return Ok(());
     }
 
-    println!("{info}");
-    Ok(())
+    Err(WallpaperError::Message(
+        "No metadata found for last applied wallpaper. Run the download first.".to_string(),
+    ))
 }
 
 fn ensure_picture_dir(path: &Path) -> Result<()> {
@@ -1890,5 +1945,54 @@ mod tests {
         assert!(info_path.exists());
         let contents = fs::read_to_string(info_path).unwrap();
         assert!(contents.contains("info"));
+    }
+
+    #[test]
+    fn show_info_uses_last_applied_candidate_metadata() {
+        let tmpdir = tempdir().unwrap();
+        let cache = CacheManager::new(tmpdir.path());
+        let candidate = WallpaperCandidate {
+            id: "spotlight-2024-02-01-1".into(),
+            source: WallpaperSource::Spotlight,
+            title: Some("Spotlight Title".into()),
+            description: Some("Spotlight description".into()),
+            attribution: Some("Copyright 2024".into()),
+            info_url: Some("https://example.com/info".into()),
+            image_url: "http://example.com/image.jpg".into(),
+            local_path: tmpdir.path().join("spotlight.jpg"),
+            date: "2024-02-01".into(),
+            metadata_xml: None,
+        };
+
+        cache
+            .upsert_candidate(&candidate.date, candidate.clone())
+            .unwrap();
+        cache
+            .write_last_applied(&LastApplied {
+                candidate_id: candidate.id.clone(),
+                source: candidate.source,
+                applied_path: candidate.local_path.clone(),
+                applied_at: 0,
+                date: Some(candidate.date.clone()),
+            })
+            .unwrap();
+
+        let mut buffer = Vec::new();
+        show_info(&cache, &mut buffer).unwrap();
+        let output = String::from_utf8(buffer).unwrap();
+        assert!(output.contains("Spotlight Title"));
+        assert!(output.contains("Spotlight description"));
+        assert!(output.contains("Copyright 2024"));
+        assert!(output.contains("https://example.com/info"));
+    }
+
+    #[test]
+    fn show_info_errors_without_last_applied() {
+        let tmpdir = tempdir().unwrap();
+        let cache = CacheManager::new(tmpdir.path());
+        let mut buffer = Vec::new();
+        let err = show_info(&cache, &mut buffer).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("previously applied wallpaper"));
     }
 }
