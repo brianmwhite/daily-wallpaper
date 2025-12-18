@@ -88,3 +88,8 @@ bing-wallpaper-daily-mac-multimonitor info
   ```sh
   cargo test
   ```
+## Future Ideas
+- Retrieve spotlight images using https://fd.api.iris.microsoft.com/v4/api/selection?&placement=88000820&bcnt=4&country=US&locale=en-US&fmt=json. Ref https://github.com/ORelio/Spotlight-Downloader/blob/master/SpotlightAPI.md
+- Retrieve NASA 
+https://apod.nasa.gov/apod/astropix.html
+https://api.nasa.gov/planetary/apod?api_key=DEMO_KEY
