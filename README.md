@@ -1,6 +1,9 @@
 # Rust CLI to download and set the Bing Daily Wallpaper on macOS
 
-This project now ships as a Rust CLI. It downloads the Bing Daily Wallpaper to `~/Pictures/bing-wallpapers/` and sets it across all desktops or a specific monitor on macOS.
+This project now ships as a Rust CLI. It downloads wallpapers to `~/Pictures/bing-wallpapers/` and sets them across all desktops or a specific monitor on macOS. Sources supported today:
+- Bing Daily (default)
+- Windows Spotlight (3 images per day; choose with `--spotlight-index`)
+- (APOD planned next)
 
 ## Requirements
 
@@ -54,7 +57,10 @@ bing-wallpaper-daily-mac-multimonitor info
   enable-auto-update             Write and load a launchd plist for periodic updates.
   disable-auto-update            Unload and remove the launchd plist.
   info                           Print the headline and copyright of the last download.
+  choose                         (placeholder) will become an interactive picker in a later release.
 
+  --source <bing|spotlight|apod> Wallpaper source (default: bing; apod pending).
+  --spotlight-index <1-3>        Which Spotlight image to apply (default: 1).
   --auto-update-name <name>      Name for the auto-update job (default: default).
   -f --force                     Force download even if the file already exists.
   -s --ssl                       Communicate with bing.com over HTTPS (default; use --no-ssl to opt out).
@@ -80,6 +86,7 @@ bing-wallpaper-daily-mac-multimonitor info
 - The experimental `--all-desktops-experimental` flag writes to `~/Library/Application Support/Dock/desktoppicture.db`. If something breaks, delete that file and restart the Dock.
 - Wallpapers and `info.xml` are saved under `~/Pictures/bing-wallpapers/` unless overridden with `--picturedir`.
 - For local development without installing, run `./run.sh ...` (calls `cargo run --`).
+- Spotlight ignores `--day` and always fetches the current feed; Bing respects `--day`. Same-day reruns reuse cached files unless `--force` is given.
 
 ## Development and tests
 

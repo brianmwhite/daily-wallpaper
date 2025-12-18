@@ -26,6 +26,7 @@ const DEFAULT_RESOLUTIONS: &[&str] = &[
 ];
 const DEFAULT_PATH: &str = "/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin";
 const BING_ARCHIVE_URL: &str = "https://www.bing.com/HPImageArchive.aspx";
+const SPOTLIGHT_URL: &str = "https://fd.api.iris.microsoft.com/v4/api/selection";
 const USER_AGENT: &str = concat!(
     "bing-wallpaper-daily-mac-multimonitor/",
     env!("CARGO_PKG_VERSION")
@@ -36,6 +37,17 @@ const PLIST_BASENAME: &str = "com.bing-wallpaper-daily-mac-multimonitor";
 const CACHE_DIR_NAME: &str = "cache";
 const CACHE_INDEX_FILE: &str = "index.json";
 const LAST_APPLIED_FILE: &str = "last_applied.json";
+const SPOTLIGHT_DEFAULT_COUNTRY: &str = "US";
+const SPOTLIGHT_DEFAULT_LOCALE: &str = "en-US";
+const SPOTLIGHT_COUNT: usize = 3;
+
+fn source_dir_name(source: WallpaperSource) -> &'static str {
+    match source {
+        WallpaperSource::Bing => "bing",
+        WallpaperSource::Spotlight => "spotlight",
+        WallpaperSource::Apod => "apod",
+    }
+}
 
 pub type Result<T> = std::result::Result<T, WallpaperError>;
 
@@ -88,6 +100,9 @@ struct Settings {
     experimental: bool,
     filename: Option<String>,
     bing_host: String,
+    source: WallpaperSource,
+    spotlight_index: usize,
+    spotlight_url_override: Option<String>,
 }
 
 impl Settings {
@@ -103,6 +118,8 @@ impl Settings {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 enum WallpaperSource {
     Bing,
+    Spotlight,
+    Apod,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,6 +167,10 @@ impl CacheManager {
 
     fn last_applied_path(&self) -> PathBuf {
         self.base_dir.join(LAST_APPLIED_FILE)
+    }
+
+    fn media_dir(&self, date: &str, source: WallpaperSource) -> PathBuf {
+        self.base_dir.join(date).join(source_dir_name(source))
     }
 
     fn load_index(&self, date: &str) -> Result<Option<CacheIndex>> {
@@ -204,6 +225,14 @@ impl CacheManager {
             .find(|cand| cand.source == source))
     }
 
+    fn find_candidate_by_id(&self, date: &str, id: &str) -> Result<Option<WallpaperCandidate>> {
+        let index = match self.load_index(date)? {
+            Some(idx) => idx,
+            None => return Ok(None),
+        };
+        Ok(index.candidates.into_iter().find(|cand| cand.id == id))
+    }
+
     fn write_last_applied(&self, data: &LastApplied) -> Result<()> {
         if let Some(parent) = self.last_applied_path().parent() {
             fs::create_dir_all(parent)?;
@@ -233,6 +262,21 @@ enum CommandArg {
     Choose,
 }
 
+#[derive(Debug, Clone, ValueEnum, PartialEq, Eq)]
+enum SourceArg {
+    Bing,
+    Spotlight,
+    Apod,
+}
+
+fn map_source(source: SourceArg) -> WallpaperSource {
+    match source {
+        SourceArg::Bing => WallpaperSource::Bing,
+        SourceArg::Spotlight => WallpaperSource::Spotlight,
+        SourceArg::Apod => WallpaperSource::Apod,
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "bing-wallpaper-daily-mac-multimonitor",
@@ -248,6 +292,16 @@ struct Cli {
 
     #[arg(short = 'f', long = "force", action = ArgAction::SetTrue)]
     force: bool,
+
+    #[arg(long = "source", value_enum, default_value_t = SourceArg::Bing)]
+    source: SourceArg,
+
+    #[arg(
+        long = "spotlight-index",
+        default_value_t = 1,
+        value_parser = clap::value_parser!(usize)
+    )]
+    spotlight_index: usize,
 
     #[arg(short = 's', long = "ssl", default_value_t = true, action = ArgAction::SetTrue)]
     ssl: bool,
@@ -299,7 +353,14 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
         ));
     }
 
-    let resolutions: Vec<String> = if let Some(res) = args.resolution {
+    if args.spotlight_index == 0 || args.spotlight_index > SPOTLIGHT_COUNT {
+        return Err(WallpaperError::Message(format!(
+            "--spotlight-index must be between 1 and {SPOTLIGHT_COUNT}"
+        )));
+    }
+
+    let single_resolution = args.resolution.clone();
+    let resolutions: Vec<String> = if let Some(res) = single_resolution {
         vec![res]
     } else if !args.resolutions.is_empty() {
         args.resolutions.clone()
@@ -308,6 +369,23 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
     };
 
     let ssl = !args.no_ssl && args.ssl;
+    let source = map_source(args.source);
+    if source != WallpaperSource::Bing
+        && (!args.resolutions.is_empty() || args.resolution.is_some())
+    {
+        log(
+            "Ignoring --resolution/--resolutions for non-Bing source.",
+            args.quiet,
+        );
+    }
+
+    if source == WallpaperSource::Spotlight && args.day != 0 {
+        log(
+            "Spotlight ignores --day; using today's feed instead.",
+            args.quiet,
+        );
+    }
+
     let settings = Settings {
         proto: if ssl { "https".into() } else { "http".into() },
         country: args.country.clone(),
@@ -323,10 +401,17 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
         experimental: args.all_desktops_experimental,
         filename: args.filename.clone(),
         bing_host: "www.bing.com".to_string(),
+        source,
+        spotlight_index: args.spotlight_index,
+        spotlight_url_override: None,
     };
 
     let cache = CacheManager::new(&settings.picture_dir);
-    let target_date = target_date_for_day(settings.day);
+    let target_date = if settings.source == WallpaperSource::Spotlight {
+        Local::now().date_naive()
+    } else {
+        target_date_for_day(settings.day)
+    };
     let date_label = target_date.to_string();
     let client = build_client()?;
 
@@ -356,87 +441,12 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
 
     ensure_picture_dir(&settings.picture_dir)?;
 
-    if !settings.force {
-        if let Some(candidate) = cache.find_candidate(&date_label, WallpaperSource::Bing)? {
-            if candidate.local_path.exists() {
-                log(
-                    &format!(
-                        "Using cached wallpaper for {} from {:?}",
-                        date_label, candidate.source
-                    ),
-                    settings.quiet,
-                );
-                ensure_info_file(&settings.picture_dir, &candidate)?;
-                apply_wallpaper(
-                    &candidate.local_path,
-                    &settings,
-                    &cache,
-                    &candidate.id,
-                    candidate.source,
-                )?;
-                return Ok(());
-            }
-        }
-    }
-
-    let archive_url = build_archive_url(settings.day, settings.country.as_deref());
-    let (url_base, metadata_body) = fetch_image_metadata(&client, &archive_url)?;
-    let metadata = parse_bing_metadata(&metadata_body)?;
-
-    let mut last_error: Option<WallpaperError> = None;
-    for res in resolutions {
-        match download_image(&client, &url_base, &res, &settings, &metadata_body) {
-            Ok(downloaded) => {
-                let candidate = WallpaperCandidate {
-                    id: format!("bing-{date_label}-{res}"),
-                    source: WallpaperSource::Bing,
-                    title: metadata.headline.clone(),
-                    description: None,
-                    attribution: metadata.copyright.clone(),
-                    info_url: metadata.copyright_link.clone(),
-                    image_url: downloaded.image_url.clone(),
-                    local_path: downloaded.path.clone(),
-                    date: date_label.clone(),
-                    metadata_xml: Some(String::from_utf8_lossy(&metadata_body).to_string()),
-                };
-
-                if settings.experimental && downloaded.skipped {
-                    log(
-                        "Download skipped; experimental all-desktops update not applied.",
-                        settings.quiet,
-                    );
-                    cache.upsert_candidate(&date_label, candidate)?;
-                    return Ok(());
-                }
-
-                let result = apply_wallpaper(
-                    &downloaded.path,
-                    &settings,
-                    &cache,
-                    &candidate.id,
-                    candidate.source,
-                );
-                cache.upsert_candidate(&date_label, candidate)?;
-
-                if let Err(err) = result {
-                    last_error = Some(err);
-                    continue;
-                }
-                return Ok(());
-            }
-            Err(err) => {
-                log(&format!("Resolution {res} failed: {err}"), settings.quiet);
-                last_error = Some(err);
-            }
-        }
-    }
-
-    if let Some(err) = last_error {
-        Err(err)
-    } else {
-        Err(WallpaperError::Message(
-            "Unable to download wallpaper for any resolution.".to_string(),
-        ))
+    match settings.source {
+        WallpaperSource::Bing => run_bing(&client, &cache, &settings, &date_label, resolutions),
+        WallpaperSource::Spotlight => run_spotlight(&client, &cache, &settings, &date_label),
+        WallpaperSource::Apod => Err(WallpaperError::Message(
+            "APOD source not implemented yet. Use --source bing or --source spotlight.".to_string(),
+        )),
     }
 }
 
@@ -495,6 +505,97 @@ fn target_date_for_day(day: i32) -> NaiveDate {
     today.checked_sub_signed(delta).unwrap_or(today)
 }
 
+fn run_bing(
+    client: &Client,
+    cache: &CacheManager,
+    settings: &Settings,
+    date_label: &str,
+    resolutions: Vec<String>,
+) -> Result<()> {
+    if !settings.force {
+        if let Some(candidate) = cache.find_candidate(date_label, WallpaperSource::Bing)? {
+            if candidate.local_path.exists() {
+                log(
+                    &format!(
+                        "Using cached wallpaper for {} from {:?}",
+                        date_label, candidate.source
+                    ),
+                    settings.quiet,
+                );
+                ensure_info_file(&settings.picture_dir, &candidate)?;
+                apply_wallpaper(
+                    &candidate.local_path,
+                    settings,
+                    cache,
+                    &candidate.id,
+                    candidate.source,
+                )?;
+                return Ok(());
+            }
+        }
+    }
+
+    let archive_url = build_archive_url(settings.day, settings.country.as_deref());
+    let (url_base, metadata_body) = fetch_image_metadata(client, &archive_url)?;
+    let metadata = parse_bing_metadata(&metadata_body)?;
+
+    let mut last_error: Option<WallpaperError> = None;
+    for res in resolutions {
+        match download_image(client, &url_base, &res, settings, &metadata_body) {
+            Ok(downloaded) => {
+                let candidate = WallpaperCandidate {
+                    id: format!("bing-{date_label}-{res}"),
+                    source: WallpaperSource::Bing,
+                    title: metadata.headline.clone(),
+                    description: None,
+                    attribution: metadata.copyright.clone(),
+                    info_url: metadata.copyright_link.clone(),
+                    image_url: downloaded.image_url.clone(),
+                    local_path: downloaded.path.clone(),
+                    date: date_label.to_string(),
+                    metadata_xml: Some(String::from_utf8_lossy(&metadata_body).to_string()),
+                };
+
+                if settings.experimental && downloaded.skipped {
+                    log(
+                        "Download skipped; experimental all-desktops update not applied.",
+                        settings.quiet,
+                    );
+                    cache.upsert_candidate(date_label, candidate)?;
+                    return Ok(());
+                }
+
+                let result = apply_wallpaper(
+                    &downloaded.path,
+                    settings,
+                    cache,
+                    &candidate.id,
+                    candidate.source,
+                );
+                cache.upsert_candidate(date_label, candidate)?;
+
+                if let Err(err) = result {
+                    last_error = Some(err);
+                    continue;
+                }
+                return Ok(());
+            }
+            Err(err) => {
+                log(&format!("Resolution {res} failed: {err}"), settings.quiet);
+                last_error = Some(err);
+            }
+        }
+    }
+
+    if let Some(err) = last_error {
+        Err(err)
+    } else {
+        Err(WallpaperError::Message(
+            "Unable to download wallpaper for any resolution.".to_string(),
+        ))
+    }
+}
+
 fn build_archive_url(day: i32, country: Option<&str>) -> String {
     let mut serializer = form_urlencoded::Serializer::new(String::new());
     serializer.append_pair("format", "xml");
@@ -504,6 +605,33 @@ fn build_archive_url(day: i32, country: Option<&str>) -> String {
         serializer.append_pair("mkt", c);
     }
     format!("{BING_ARCHIVE_URL}?{}", serializer.finish())
+}
+
+fn build_spotlight_url(settings: &Settings) -> String {
+    if let Some(override_url) = &settings.spotlight_url_override {
+        return override_url.clone();
+    }
+    let (country, locale) = match &settings.country {
+        Some(c) => {
+            let parts: Vec<&str> = c.split('-').collect();
+            let country = parts
+                .first()
+                .map(|s| s.to_uppercase())
+                .unwrap_or_else(|| SPOTLIGHT_DEFAULT_COUNTRY.to_string());
+            (country, c.clone())
+        }
+        None => (
+            SPOTLIGHT_DEFAULT_COUNTRY.to_string(),
+            SPOTLIGHT_DEFAULT_LOCALE.to_string(),
+        ),
+    };
+    let mut serializer = form_urlencoded::Serializer::new(String::new());
+    serializer.append_pair("placement", "88000820");
+    serializer.append_pair("bcnt", &SPOTLIGHT_COUNT.to_string());
+    serializer.append_pair("country", &country);
+    serializer.append_pair("locale", &locale);
+    serializer.append_pair("fmt", "json");
+    format!("{SPOTLIGHT_URL}?{}", serializer.finish())
 }
 
 fn fetch_image_metadata(client: &Client, archive_url: &str) -> Result<(String, Vec<u8>)> {
@@ -587,6 +715,11 @@ struct DownloadedImage {
     path: PathBuf,
     skipped: bool,
     image_url: String,
+}
+
+#[derive(Debug)]
+struct DownloadedFile {
+    path: PathBuf,
 }
 
 fn download_image(
@@ -696,6 +829,60 @@ fn download_image(
     })
 }
 
+fn download_to_path(
+    client: &Client,
+    url: &str,
+    target_path: &Path,
+    force: bool,
+    quiet: bool,
+) -> Result<DownloadedFile> {
+    if target_path.exists() && !force {
+        log(
+            &format!(
+                "Skipping download, already present: {}",
+                target_path.display()
+            ),
+            quiet,
+        );
+        return Ok(DownloadedFile {
+            path: target_path.to_path_buf(),
+        });
+    }
+
+    if let Some(parent) = target_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    log(&format!("Downloading {}", url), quiet);
+    let temp_path = unique_temp_path(target_path);
+    let download_result = (|| -> Result<()> {
+        let _ = fs::remove_file(&temp_path);
+        let mut response = client.get(url).timeout(IMAGE_TIMEOUT).send()?;
+        let status = response.status();
+        if status != StatusCode::OK {
+            return Err(WallpaperError::Status {
+                url: url.to_string(),
+                status: status.as_u16(),
+            });
+        }
+        let mut file = File::create(&temp_path)?;
+        response.copy_to(&mut file)?;
+        file.flush()?;
+        file.sync_all()?;
+        fs::rename(&temp_path, target_path)?;
+        Ok(())
+    })();
+
+    if let Err(err) = download_result {
+        let _ = fs::remove_file(&temp_path);
+        return Err(err);
+    }
+
+    Ok(DownloadedFile {
+        path: target_path.to_path_buf(),
+    })
+}
+
 fn unique_temp_path(target_path: &Path) -> PathBuf {
     let pid = std::process::id();
     let nanos = SystemTime::now()
@@ -730,6 +917,206 @@ fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         return Err(err);
     }
     Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct SpotlightResponse {
+    #[serde(default)]
+    batchrsp: Option<SpotlightBatch>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SpotlightBatch {
+    #[serde(default)]
+    items: Vec<SpotlightItemWrapper>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SpotlightItemWrapper {
+    item: SpotlightItem,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum SpotlightItem {
+    RawString(String),
+    Object(SpotlightPayload),
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct SpotlightPayload {
+    #[serde(default)]
+    ad: SpotlightAd,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+struct SpotlightAd {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    copyright: Option<String>,
+    #[serde(default, rename = "ctaUri")]
+    cta_uri: Option<String>,
+    #[serde(default, rename = "landscapeImage")]
+    landscape_image: Option<SpotlightImage>,
+    #[serde(default, rename = "entityId")]
+    _entity_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct SpotlightImage {
+    asset: String,
+}
+
+fn run_spotlight(
+    client: &Client,
+    cache: &CacheManager,
+    settings: &Settings,
+    date_label: &str,
+) -> Result<()> {
+    let candidate_id = format!("spotlight-{date_label}-{}", settings.spotlight_index);
+    if !settings.force {
+        if let Some(candidate) = cache.find_candidate_by_id(date_label, &candidate_id)? {
+            if candidate.local_path.exists() {
+                log(
+                    &format!(
+                        "Using cached Spotlight wallpaper for {} (index {})",
+                        date_label, settings.spotlight_index
+                    ),
+                    settings.quiet,
+                );
+                return apply_wallpaper(
+                    &candidate.local_path,
+                    settings,
+                    cache,
+                    &candidate.id,
+                    candidate.source,
+                );
+            }
+        }
+    }
+
+    let candidates = fetch_spotlight_candidates(client, cache, settings, date_label)?;
+    if candidates.is_empty() {
+        return Err(WallpaperError::Message(
+            "No Spotlight images available.".to_string(),
+        ));
+    }
+    let idx = settings.spotlight_index.saturating_sub(1);
+    if idx >= candidates.len() {
+        return Err(WallpaperError::Message(format!(
+            "Requested Spotlight index {} not available; {} images found.",
+            settings.spotlight_index,
+            candidates.len()
+        )));
+    }
+    let candidate = &candidates[idx];
+    apply_wallpaper(
+        &candidate.local_path,
+        settings,
+        cache,
+        &candidate.id,
+        candidate.source,
+    )
+}
+
+fn fetch_spotlight_candidates(
+    client: &Client,
+    cache: &CacheManager,
+    settings: &Settings,
+    date_label: &str,
+) -> Result<Vec<WallpaperCandidate>> {
+    let url = build_spotlight_url(settings);
+    let response = client.get(url.clone()).timeout(METADATA_TIMEOUT).send()?;
+    if response.status() != StatusCode::OK {
+        return Err(WallpaperError::Status {
+            url,
+            status: response.status().as_u16(),
+        });
+    }
+    let body = response.bytes()?.to_vec();
+    let payloads = parse_spotlight_payloads(&body)?;
+    if payloads.is_empty() {
+        return Err(WallpaperError::Message(
+            "Spotlight response did not include any images.".to_string(),
+        ));
+    }
+
+    let media_dir = cache.media_dir(date_label, WallpaperSource::Spotlight);
+    fs::create_dir_all(&media_dir)?;
+
+    let mut candidates = Vec::new();
+    for (idx, payload) in payloads.into_iter().take(SPOTLIGHT_COUNT).enumerate() {
+        let Some(image) = payload.ad.landscape_image.clone() else {
+            continue;
+        };
+        let asset_url = image.asset;
+        let ordinal = idx + 1;
+        let file_name = format!("spotlight_{date_label}_{ordinal}.jpg");
+        let local_path = media_dir.join(file_name);
+
+        let download = download_to_path(
+            client,
+            &asset_url,
+            &local_path,
+            settings.force,
+            settings.quiet,
+        )?;
+
+        let candidate_id = format!("spotlight-{date_label}-{ordinal}");
+        let candidate = WallpaperCandidate {
+            id: candidate_id,
+            source: WallpaperSource::Spotlight,
+            title: payload.ad.title.clone(),
+            description: payload.ad.description.clone(),
+            attribution: payload.ad.copyright.clone(),
+            info_url: payload
+                .ad
+                .cta_uri
+                .as_ref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(strip_edge_scheme),
+            image_url: asset_url,
+            local_path: download.path,
+            date: date_label.to_string(),
+            metadata_xml: None,
+        };
+        cache.upsert_candidate(date_label, candidate.clone())?;
+        candidates.push(candidate);
+    }
+
+    Ok(candidates)
+}
+
+fn parse_spotlight_payloads(body: &[u8]) -> Result<Vec<SpotlightPayload>> {
+    let parsed: SpotlightResponse = serde_json::from_slice(body)?;
+    let Some(batch) = parsed.batchrsp else {
+        return Ok(Vec::new());
+    };
+    let mut items = Vec::new();
+    for wrapper in batch.items {
+        match wrapper.item {
+            SpotlightItem::RawString(raw) => {
+                if let Ok(obj) = serde_json::from_str::<SpotlightPayload>(&raw) {
+                    items.push(obj);
+                }
+            }
+            SpotlightItem::Object(obj) => items.push(obj),
+        }
+    }
+    Ok(items)
+}
+
+fn strip_edge_scheme(url: &str) -> String {
+    let trimmed = url.trim();
+    if let Some(rest) = trimmed.strip_prefix("microsoft-edge:") {
+        rest.to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn apply_wallpaper(
@@ -1010,6 +1397,9 @@ mod tests {
             experimental: false,
             filename: filename.map(ToString::to_string),
             bing_host: "www.bing.com".into(),
+            source: WallpaperSource::Bing,
+            spotlight_index: 1,
+            spotlight_url_override: None,
         }
     }
 
@@ -1142,6 +1532,72 @@ mod tests {
             .collect();
         assert!(temps.is_empty(), "Temporary files must be cleaned up");
         assert_eq!(_mock.hits(), 1);
+    }
+
+    #[test]
+    fn spotlight_downloads_and_reuses_cache() {
+        let server = MockServer::start();
+        let api_url = server.url("/spotlight");
+        let img1 = server.url("/img1.jpg");
+        let img2 = server.url("/img2.jpg");
+        let img3 = server.url("/img3.jpg");
+
+        let raw_payload = format!(
+            r#"{{"ad":{{"title":"One","description":"D1","copyright":"C1","ctaUri":"https://example.com/1","landscapeImage":{{"asset":"{img1}"}}, "entityId":"raw1"}}}}"#
+        );
+        let raw_payload_string = serde_json::to_string(&raw_payload).unwrap();
+
+        let body = format!(
+            r#"{{
+            "batchrsp": {{
+                "items": [
+                    {{ "item": {raw_payload_string} }},
+                    {{ "item": {{ "ad": {{ "title": "Two", "landscapeImage": {{ "asset": "{img2}" }}, "entityId": "id2" }} }} }},
+                    {{ "item": {{ "ad": {{ "title": "Three", "landscapeImage": {{ "asset": "{img3}" }}, "entityId": "id3" }} }} }}
+                ]
+            }}
+        }}"#
+        );
+
+        let api_mock = server.mock(|when, then| {
+            when.method(GET).path("/spotlight");
+            then.status(200).body(body.clone());
+        });
+        let img1_mock = server.mock(|when, then| {
+            when.method(GET).path("/img1.jpg");
+            then.status(200).body("img1");
+        });
+        let img2_mock = server.mock(|when, then| {
+            when.method(GET).path("/img2.jpg");
+            then.status(200).body("img2");
+        });
+        let img3_mock = server.mock(|when, then| {
+            when.method(GET).path("/img3.jpg");
+            then.status(200).body("img3");
+        });
+
+        let tmpdir = tempdir().unwrap();
+        let mut settings = make_settings(tmpdir.path(), None, false);
+        settings.source = WallpaperSource::Spotlight;
+        settings.spotlight_index = 2;
+        settings.spotlight_url_override = Some(api_url.clone());
+
+        let cache = CacheManager::new(tmpdir.path());
+        let client = build_client().unwrap();
+        let date_label = Local::now().date_naive().to_string();
+
+        run_spotlight(&client, &cache, &settings, &date_label).unwrap();
+        assert_eq!(api_mock.hits(), 1);
+        assert_eq!(img1_mock.hits(), 1);
+        assert_eq!(img2_mock.hits(), 1);
+        assert_eq!(img3_mock.hits(), 1);
+
+        // Second run should reuse cache and skip network.
+        run_spotlight(&client, &cache, &settings, &date_label).unwrap();
+        assert_eq!(api_mock.hits(), 1);
+        assert_eq!(img1_mock.hits(), 1);
+        assert_eq!(img2_mock.hits(), 1);
+        assert_eq!(img3_mock.hits(), 1);
     }
 
     #[test]
