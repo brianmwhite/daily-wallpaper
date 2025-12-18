@@ -19,6 +19,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use url::form_urlencoded;
 
+mod sources;
+use sources::{Source, SourceContext, SourceRegistry};
 const DEFAULT_RESOLUTIONS: &[&str] = &[
     "1920x1200",
     "1920x1080",
@@ -447,13 +449,8 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
     };
 
     let cache = CacheManager::new(&settings.picture_dir);
-    let target_date = if settings.source == WallpaperSource::Spotlight {
-        Local::now().date_naive()
-    } else {
-        target_date_for_day(settings.day)
-    };
-    let date_label = target_date.to_string();
     let client = build_client()?;
+    let registry = SourceRegistry::new();
 
     match args.command {
         Some(CommandArg::EnableAutoUpdate) => {
@@ -472,24 +469,23 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
         }
         Some(CommandArg::Choose) => {
             ensure_picture_dir(&settings.picture_dir)?;
-            return run_choose(&client, &cache, &settings, &date_label, resolutions);
+            return run_choose(&client, &cache, &registry, &settings, resolutions);
         }
         None => {}
     }
 
     ensure_picture_dir(&settings.picture_dir)?;
 
-    let result = match settings.source {
-        WallpaperSource::Bing => run_bing(&client, &cache, &settings, &date_label, resolutions),
-        WallpaperSource::Spotlight => run_spotlight(
-            &client,
-            &cache,
-            &settings,
-            &date_label,
-            settings.spotlight_index,
-        ),
-        WallpaperSource::Apod => run_apod(&client, &cache, &settings, &date_label),
+    let source = require_source(&registry, settings.source)?;
+    let date_label = date_label_for(Some(source), &settings);
+    let ctx = SourceContext {
+        client: &client,
+        cache: &cache,
+        settings: &settings,
+        date_label: &date_label,
+        resolutions: &resolutions,
     };
+    let result = run_source(source, &ctx);
 
     if result.is_ok() {
         if let Some(days) = settings.prune_cache_days {
@@ -555,29 +551,43 @@ fn target_date_for_day(day: i32) -> NaiveDate {
     today.checked_sub_signed(delta).unwrap_or(today)
 }
 
-fn run_bing(
-    client: &Client,
-    cache: &CacheManager,
-    settings: &Settings,
-    date_label: &str,
-    resolutions: Vec<String>,
-) -> Result<()> {
-    let fetched = fetch_bing_candidate(client, cache, settings, date_label, resolutions)?;
-    if settings.experimental && fetched.skipped_download {
+fn date_label_for(source: Option<&dyn Source>, settings: &Settings) -> String {
+    let use_day = source.map(|s| s.supports_day()).unwrap_or(true);
+    let target_date = if use_day {
+        target_date_for_day(settings.day)
+    } else {
+        Local::now().date_naive()
+    };
+    target_date.to_string()
+}
+
+fn run_source(source: &dyn Source, ctx: &SourceContext<'_>) -> Result<()> {
+    let fetch_result = source.fetch(ctx)?;
+    let candidate = source
+        .pick_default(&fetch_result.candidates, ctx.settings)?
+        .clone();
+
+    if ctx.settings.experimental && fetch_result.skipped_download {
         log(
             "Download skipped; experimental all-desktops update not applied.",
-            settings.quiet,
+            ctx.settings.quiet,
         );
         return Ok(());
     }
 
     apply_wallpaper(
-        &fetched.candidate.local_path,
-        settings,
-        cache,
-        &fetched.candidate.id,
-        fetched.candidate.source,
+        &candidate.local_path,
+        ctx.settings,
+        ctx.cache,
+        &candidate.id,
+        candidate.source,
     )
+}
+
+fn require_source<'a>(registry: &'a SourceRegistry, id: WallpaperSource) -> Result<&'a dyn Source> {
+    registry
+        .get(id)
+        .ok_or_else(|| WallpaperError::Message(format!("Source {:?} is not registered.", id)))
 }
 
 struct FetchedCandidate {
@@ -658,8 +668,8 @@ fn fetch_bing_candidate(
 fn run_choose(
     client: &Client,
     cache: &CacheManager,
+    registry: &SourceRegistry,
     settings: &Settings,
-    date_label: &str,
     resolutions: Vec<String>,
 ) -> Result<()> {
     let mut current_settings = settings.clone();
@@ -667,7 +677,7 @@ fn run_choose(
 
     loop {
         let candidates =
-            gather_candidates(client, cache, &current_settings, date_label, &current_res)?;
+            gather_candidates(client, cache, registry, &current_settings, &current_res)?;
         if candidates.is_empty() {
             return Err(WallpaperError::Message(
                 "No wallpapers available to choose from.".to_string(),
@@ -769,25 +779,28 @@ fn run_choose(
 fn gather_candidates(
     client: &Client,
     cache: &CacheManager,
+    registry: &SourceRegistry,
     settings: &Settings,
-    date_label: &str,
     resolutions: &[String],
 ) -> Result<Vec<WallpaperCandidate>> {
     let mut result = Vec::new();
 
-    match fetch_bing_candidate(client, cache, settings, date_label, resolutions.to_vec()) {
-        Ok(fetched) => result.push(fetched.candidate),
-        Err(err) => log(&format!("Bing unavailable: {err}"), settings.quiet),
-    }
-
-    match fetch_spotlight_candidates(client, cache, settings, date_label) {
-        Ok(cands) => result.extend(cands),
-        Err(err) => log(&format!("Spotlight unavailable: {err}"), settings.quiet),
-    }
-
-    match fetch_apod_candidate(client, cache, settings, date_label) {
-        Ok(cand) => result.push(cand),
-        Err(err) => log(&format!("APOD unavailable: {err}"), settings.quiet),
+    for source in registry.all() {
+        let date_label = date_label_for(Some(source), settings);
+        let ctx = SourceContext {
+            client,
+            cache,
+            settings,
+            date_label: &date_label,
+            resolutions,
+        };
+        match source.fetch(&ctx) {
+            Ok(fetched) => result.extend(fetched.candidates),
+            Err(err) => log(
+                &format!("{} unavailable: {err}", source.label()),
+                settings.quiet,
+            ),
+        }
     }
 
     Ok(result)
@@ -1191,6 +1204,7 @@ struct ApodResponse {
     copyright: Option<String>,
 }
 
+#[cfg(test)]
 fn run_spotlight(
     client: &Client,
     cache: &CacheManager,
@@ -1198,28 +1212,18 @@ fn run_spotlight(
     date_label: &str,
     pick_index: usize,
 ) -> Result<()> {
-    let candidates = fetch_spotlight_candidates(client, cache, settings, date_label)?;
-    if candidates.is_empty() {
-        return Err(WallpaperError::Message(
-            "No Spotlight images available.".to_string(),
-        ));
-    }
-    let idx = pick_index.saturating_sub(1);
-    if idx >= candidates.len() {
-        return Err(WallpaperError::Message(format!(
-            "Requested Spotlight index {} not available; {} images found.",
-            pick_index,
-            candidates.len()
-        )));
-    }
-    let candidate = &candidates[idx];
-    apply_wallpaper(
-        &candidate.local_path,
-        settings,
+    let mut patched_settings = settings.clone();
+    patched_settings.spotlight_index = pick_index;
+    let registry = SourceRegistry::new();
+    let source = require_source(&registry, WallpaperSource::Spotlight)?;
+    let ctx = SourceContext {
+        client,
         cache,
-        &candidate.id,
-        candidate.source,
-    )
+        settings: &patched_settings,
+        date_label,
+        resolutions: &[],
+    };
+    run_source(source, &ctx)
 }
 
 fn fetch_spotlight_candidates(
@@ -1332,20 +1336,23 @@ fn strip_edge_scheme(url: &str) -> String {
     }
 }
 
+#[cfg(test)]
 fn run_apod(
     client: &Client,
     cache: &CacheManager,
     settings: &Settings,
     date_label: &str,
 ) -> Result<()> {
-    let candidate = fetch_apod_candidate(client, cache, settings, date_label)?;
-    apply_wallpaper(
-        &candidate.local_path,
-        settings,
+    let registry = SourceRegistry::new();
+    let source = require_source(&registry, WallpaperSource::Apod)?;
+    let ctx = SourceContext {
+        client,
         cache,
-        &candidate.id,
-        candidate.source,
-    )
+        settings,
+        date_label,
+        resolutions: &[],
+    };
+    run_source(source, &ctx)
 }
 
 fn fetch_apod_candidate(
