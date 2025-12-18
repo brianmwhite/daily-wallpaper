@@ -2,6 +2,7 @@ use chrono::{Duration as ChronoDuration, Local, NaiveDate};
 use clap::{ArgAction, Parser, ValueEnum};
 use image::imageops::FilterType;
 use image::GenericImageView;
+use inquire::Select;
 use plist::{Dictionary, Value};
 use reqwest::blocking::Client;
 use reqwest::StatusCode;
@@ -656,49 +657,77 @@ fn run_choose(
             ));
         }
 
-        println!("Available wallpapers:");
-        for (idx, cand) in candidates.iter().enumerate() {
-            let title = cand
-                .title
-                .as_deref()
-                .filter(|t| !t.is_empty())
-                .unwrap_or("(no title)");
-            let attribution = cand
-                .attribution
-                .as_deref()
-                .filter(|t| !t.is_empty())
-                .unwrap_or("");
-            println!(
-                "  {idx}: [{}] {}{}",
-                source_label(cand.source),
-                title,
-                if attribution.is_empty() {
-                    "".to_string()
-                } else {
-                    format!(" — {}", attribution)
-                }
-            );
-        }
-        println!("Enter number to apply, 'p <n>' to preview, 'r' to refresh (force), 'q' to quit.");
-        print!("Choice: ");
-        let _ = io::stdout().flush();
+        let labels: Vec<String> = candidates
+            .iter()
+            .enumerate()
+            .map(|(idx, cand)| {
+                let title = cand
+                    .title
+                    .as_deref()
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or("(no title)");
+                let attribution = cand
+                    .attribution
+                    .as_deref()
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or("");
+                format!(
+                    "{idx}: [{}] {}{}",
+                    source_label(cand.source),
+                    title,
+                    if attribution.is_empty() {
+                        "".to_string()
+                    } else {
+                        format!(" — {}", attribution)
+                    }
+                )
+            })
+            .collect();
 
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-        let trimmed = input.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if trimmed.eq_ignore_ascii_case("q") || trimmed.eq_ignore_ascii_case("quit") {
-            return Ok(());
-        }
-        if trimmed.eq_ignore_ascii_case("r") || trimmed.eq_ignore_ascii_case("refresh") {
-            current_settings.force = true;
-            continue;
-        }
-        if let Some(rest) = trimmed.strip_prefix("p ") {
-            if let Ok(num) = rest.trim().parse::<usize>() {
-                if let Some(cand) = candidates.get(num) {
+        let selection = Select::new(
+            "Select a wallpaper (arrows + Enter). Choose Preview/Apply next.",
+            labels,
+        )
+        .prompt();
+
+        let idx = match selection {
+            Ok(label) => {
+                // labels are formatted as "{idx}: ..."
+                let parts: Vec<&str> = label.split(':').collect();
+                if let Some(num_str) = parts.first() {
+                    num_str.parse::<usize>().unwrap_or(0)
+                } else {
+                    0
+                }
+            }
+            Err(_) => return Ok(()),
+        };
+
+        if let Some(cand) = candidates.get(idx) {
+            let action = Select::new(
+                "Action",
+                vec![
+                    "Apply",
+                    "Preview (Quick Look)",
+                    "Refresh list (force re-download)",
+                    "Quit chooser",
+                ],
+            )
+            .prompt();
+            match action {
+                Ok(choice) if choice.starts_with("Apply") => {
+                    match apply_wallpaper(
+                        &cand.local_path,
+                        &current_settings,
+                        cache,
+                        &cand.id,
+                        cand.source,
+                    ) {
+                        Ok(()) => return Ok(()),
+                        Err(err) => println!("Failed to apply wallpaper: {err}"),
+                    }
+                }
+                Ok(choice) if choice.starts_with("Preview") => {
                     if cand.local_path.exists() {
                         let path_str = cand.local_path.to_string_lossy().to_string();
                         let _ = run_checked(
@@ -710,24 +739,11 @@ fn run_choose(
                         println!("File not found for preview: {}", cand.local_path.display());
                     }
                 }
-            }
-            continue;
-        }
-
-        if let Ok(num) = trimmed.parse::<usize>() {
-            if let Some(cand) = candidates.get(num) {
-                match apply_wallpaper(
-                    &cand.local_path,
-                    &current_settings,
-                    cache,
-                    &cand.id,
-                    cand.source,
-                ) {
-                    Ok(()) => return Ok(()),
-                    Err(err) => {
-                        println!("Failed to apply wallpaper: {err}");
-                    }
+                Ok(choice) if choice.starts_with("Refresh") => {
+                    current_settings.force = true;
+                    continue;
                 }
+                _ => return Ok(()),
             }
         }
     }

@@ -57,7 +57,7 @@ bing-wallpaper-daily-mac-multimonitor info
   enable-auto-update             Write and load a launchd plist for periodic updates.
   disable-auto-update            Unload and remove the launchd plist.
   info                           Print the headline and copyright of the last download.
-  choose                         Interactive picker: shows Bing + Spotlight (3) + APOD and lets you preview/apply.
+  choose                         Interactive picker (arrows/Enter) for Bing + Spotlight (3) + APOD; preview via Quick Look.
 
   --source <bing|spotlight|apod> Wallpaper source (default: bing).
   --spotlight-index <1-3>        Which Spotlight image to apply (default: 1).
@@ -91,7 +91,7 @@ bing-wallpaper-daily-mac-multimonitor info
 - For local development without installing, run `./run.sh ...` (calls `cargo run --`).
 - Spotlight ignores `--day` and always fetches the current feed; Bing respects `--day`. Same-day reruns reuse cached files unless `--force` is given.
 - APOD respects `--day`, skips non-image media, defaults to the NASA DEMO_KEY (supply your own key or set `NASA_API_KEY` to avoid rate limits), and center-crops/resizes to your primary display’s aspect ratio by default (disable with `--no-apod-crop`).
-- `choose` downloads/caches today’s Bing, Spotlight, and APOD candidates (if available), shows a numbered list, lets you preview with Quick Look (`p <n>`), and applies the selected item. Refresh with `r` to re-download with `--force`, or quit with `q`.
+- `choose` downloads/caches today’s Bing, Spotlight, and APOD candidates (if available), shows a list you can navigate with arrows, lets you preview with Quick Look, refresh, or apply.
 
 ## Development and tests
 
