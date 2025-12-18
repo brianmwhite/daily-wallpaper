@@ -1,6 +1,6 @@
 use chrono::{Duration as ChronoDuration, Local, NaiveDate};
 use clap::{ArgAction, Parser, ValueEnum};
-use inquire::Select;
+use inquire::{InquireError, Select};
 use indicatif::{ProgressBar, ProgressStyle};
 use plist::{Dictionary, Value};
 use reqwest::blocking::Client;
@@ -249,7 +249,7 @@ impl CacheManager {
     }
 
     #[allow(dead_code)]
-    fn read_last_applied(&self) -> Result<Option<LastApplied>> {
+    pub fn read_last_applied(&self) -> Result<Option<LastApplied>> {
         let path = self.last_applied_path();
         if !path.exists() {
             return Ok(None);
@@ -266,6 +266,7 @@ enum CommandArg {
     DisableAutoUpdate,
     Info,
     Choose,
+    Reapply,
 }
 
 #[derive(Debug, Clone, ValueEnum, PartialEq, Eq)]
@@ -466,6 +467,10 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
             ensure_picture_dir(&settings.picture_dir)?;
             return run_choose(&client, &cache, &registry, &settings, resolutions);
         }
+        Some(CommandArg::Reapply) => {
+            ensure_picture_dir(&settings.picture_dir)?;
+            return reapply_last_wallpaper(&cache, &settings);
+        }
         None => {}
     }
 
@@ -634,6 +639,7 @@ fn run_choose(
 ) -> Result<()> {
     let mut current_settings = settings.clone();
     let current_res = resolutions;
+    let mut selected_idx: Option<usize> = None;
 
     loop {
         let candidates =
@@ -677,6 +683,7 @@ fn run_choose(
             "Select a wallpaper (arrows + Enter). Choose Preview/Apply next.",
             labels,
         )
+        .with_starting_cursor(selected_idx.unwrap_or(0))
         .prompt();
 
         let idx = match selection {
@@ -691,48 +698,58 @@ fn run_choose(
             }
             Err(_) => return Ok(()),
         };
+        selected_idx = Some(idx);
 
         if let Some(cand) = candidates.get(idx) {
-            let action = Select::new(
-                "Action",
-                vec![
-                    "Apply",
-                    "Preview (Quick Look)",
-                    "Refresh list (force re-download)",
-                    "Quit chooser",
-                ],
-            )
-            .prompt();
-            match action {
-                Ok(choice) if choice.starts_with("Apply") => {
-                    match apply_wallpaper(
-                        &cand.local_path,
-                        &current_settings,
-                        cache,
-                        &cand.id,
-                        cand.source,
-                    ) {
-                        Ok(()) => return Ok(()),
-                        Err(err) => println!("Failed to apply wallpaper: {err}"),
+            let mut action_cursor = 0_usize;
+            loop {
+                let action = Select::new(
+                    "Action",
+                    vec![
+                        "Preview (Quick Look)",
+                        "Apply",
+                        "Refresh list (force re-download)",
+                        "Quit chooser",
+                    ],
+                )
+                .with_starting_cursor(action_cursor)
+                .prompt();
+                match action {
+                    Ok(choice) if choice.starts_with("Preview") => {
+                        if cand.local_path.exists() {
+                            let path_str = cand.local_path.to_string_lossy().to_string();
+                            let _ = run_checked(
+                                "qlmanage",
+                                &["-p", path_str.as_str()],
+                                "Quick Look preview",
+                            );
+                        } else {
+                            println!("File not found for preview: {}", cand.local_path.display());
+                        }
+                        // After preview, default to Apply on next prompt.
+                        action_cursor = 1;
+                        continue;
                     }
-                }
-                Ok(choice) if choice.starts_with("Preview") => {
-                    if cand.local_path.exists() {
-                        let path_str = cand.local_path.to_string_lossy().to_string();
-                        let _ = run_checked(
-                            "qlmanage",
-                            &["-p", path_str.as_str()],
-                            "Quick Look preview",
-                        );
-                    } else {
-                        println!("File not found for preview: {}", cand.local_path.display());
+                    Ok(choice) if choice.starts_with("Apply") => {
+                        match apply_wallpaper(
+                            &cand.local_path,
+                            &current_settings,
+                            cache,
+                            &cand.id,
+                            cand.source,
+                        ) {
+                            Ok(()) => return Ok(()),
+                            Err(err) => println!("Failed to apply wallpaper: {err}"),
+                        }
                     }
+                    Ok(choice) if choice.starts_with("Refresh") => {
+                        current_settings.force = true;
+                        break;
+                    }
+                    Ok(choice) if choice.starts_with("Quit") => return Ok(()),
+                    Err(InquireError::OperationCanceled) => break,
+                    _ => return Ok(()),
                 }
-                Ok(choice) if choice.starts_with("Refresh") => {
-                    current_settings.force = true;
-                    continue;
-                }
-                _ => return Ok(()),
             }
         }
     }
@@ -940,6 +957,37 @@ fn apply_wallpaper(
     }
 
     result
+}
+
+fn reapply_last_wallpaper(cache: &CacheManager, settings: &Settings) -> Result<()> {
+    let Some(last) = cache.read_last_applied()? else {
+        return Err(WallpaperError::Message(
+            "No previously applied wallpaper found. Choose a wallpaper first.".to_string(),
+        ));
+    };
+    if !last.applied_path.exists() {
+        return Err(WallpaperError::Message(format!(
+            "Previously applied wallpaper is missing: {}",
+            last.applied_path.display()
+        )));
+    }
+
+    log(
+        &format!(
+            "Reapplying last wallpaper ({:?}) from {}",
+            last.source,
+            last.applied_path.display()
+        ),
+        settings.quiet,
+    );
+
+    apply_wallpaper(
+        &last.applied_path,
+        settings,
+        cache,
+        &last.candidate_id,
+        last.source,
+    )
 }
 
 fn ensure_info_file(picture_dir: &Path, candidate: &WallpaperCandidate) -> Result<()> {
