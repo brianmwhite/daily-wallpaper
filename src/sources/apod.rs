@@ -3,7 +3,7 @@ use crate::{
     WallpaperError, WallpaperSource, METADATA_TIMEOUT,
 };
 use image::imageops::FilterType;
-use image::GenericImageView;
+use image::{GenericImageView, ImageFormat};
 use reqwest::blocking::Client;
 use reqwest::StatusCode;
 use serde::Deserialize;
@@ -177,16 +177,25 @@ fn crop_and_resize_apod(path: &Path) -> Result<()> {
     let y0 = (orig_h - crop_h) / 2;
     let cropped = img.crop_imm(x0, y0, crop_w, crop_h);
 
-    let processed = if target_w > 0 && target_h > 0 {
-        image::imageops::resize(&cropped, target_w, target_h, FilterType::Lanczos3)
+    let processed: image::DynamicImage = if target_w > 0 && target_h > 0 {
+        image::DynamicImage::ImageRgba8(image::imageops::resize(
+            &cropped,
+            target_w,
+            target_h,
+            FilterType::Lanczos3,
+        ))
     } else {
-        cropped.to_rgba8()
+        image::DynamicImage::ImageRgba8(cropped.to_rgba8())
     };
 
+    let processed_rgb = processed.to_rgb8();
+
     let temp_path = unique_temp_path(path);
-    processed.save(&temp_path).map_err(|err| {
-        WallpaperError::Message(format!("Unable to save processed APOD image: {err}"))
-    })?;
+    processed_rgb
+        .save_with_format(&temp_path, ImageFormat::Jpeg)
+        .map_err(|err| {
+            WallpaperError::Message(format!("Unable to save processed APOD image: {err}"))
+        })?;
     if let Ok(f) = fs::File::open(&temp_path) {
         let _ = f.sync_all();
     }
@@ -220,4 +229,31 @@ pub(crate) fn parse_resolution(res_str: &str) -> Option<(u32, u32)> {
     let w = parts.get(0)?.trim().parse().ok()?;
     let h = parts.get(1)?.trim().parse().ok()?;
     Some((w, h))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::{ImageBuffer, Rgba};
+    use tempfile::tempdir;
+
+    #[test]
+    fn crop_and_resize_handles_rgba_by_saving_jpeg() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("input.png");
+
+        let img: ImageBuffer<Rgba<u8>, Vec<u8>> = ImageBuffer::from_fn(10, 10, |_, _| {
+            Rgba([10, 20, 30, 255])
+        });
+        img.save(&path).unwrap();
+
+        crop_and_resize_apod(&path).unwrap();
+        let loaded = image::io::Reader::open(&path)
+            .unwrap()
+            .with_guessed_format()
+            .unwrap()
+            .decode()
+            .unwrap();
+        assert!(!loaded.color().has_alpha(), "should be RGB after re-save");
+    }
 }
