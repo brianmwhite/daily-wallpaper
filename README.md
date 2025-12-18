@@ -1,18 +1,30 @@
-# Rust CLI to download and set the Bing Daily Wallpaper on macOS
+# Bing Wallpaper Daily for macOS (multi-monitor)
 
-This project now ships as a Rust CLI. It downloads wallpapers to `~/Pictures/daily-wallpapers/` and sets them across all desktops or a specific monitor on macOS. Sources supported today:
-- Bing Daily (default)
-- Windows Spotlight (3 images per day; choose with `--spotlight-index`)
-- NASA APOD (images only; use `--apod-hd` to prefer the HD URL)
+Rust CLI that downloads Bing/Spotlight/NASA APOD wallpapers to `~/Pictures/daily-wallpapers/` and applies them across all desktops or a specific monitor on macOS.
+
+- Multi-monitor aware with per-monitor targeting or all desktops
+- Sources: Bing Daily (default), Windows Spotlight (3 per day via `--spotlight-index`), NASA APOD (images only, optional HD, optional crop)
+- Interactive chooser with Quick Look previews
+- `launchd` integration for scheduled updates
+- Configurable defaults via `~/.wallpaperconfig` (TOML)
 
 ## Requirements
 
 - macOS
 - Rust toolchain (`rustup` recommended)
 
+## Installation
+
+Install the CLI on your `PATH`:
+
+```sh
+cargo install --path .
+bing-wallpaper-daily-mac-multimonitor
+```
+
 ## Quick start
 
-- Run once from the repo without installing:
+- Run once from the repo (no install):
 
   ```sh
   ./run.sh [options]
@@ -20,16 +32,37 @@ This project now ships as a Rust CLI. It downloads wallpapers to `~/Pictures/dai
   cargo run -- [options]
   ```
 
-- Install the CLI locally so it is on your `PATH`:
+- After installing, just call the binary:
 
   ```sh
-  cargo install --path .
+  bing-wallpaper-daily-mac-multimonitor [options]
+  ```
+
+## Usage
+
+- Download today’s Bing wallpaper to the default directory and apply to all desktops (default behavior):
+
+  ```sh
   bing-wallpaper-daily-mac-multimonitor
   ```
 
-## Automatic daily updates (launchd)
+- Apply to a specific monitor (e.g., second display):
 
-Create a LaunchAgent that refreshes the wallpaper every 30 minutes (run at load enabled):
+  ```sh
+  bing-wallpaper-daily-mac-multimonitor --monitor 2
+  ```
+
+- Choose interactively between Bing, Spotlight, and APOD for today (Quick Look previews):
+
+  ```sh
+  bing-wallpaper-daily-mac-multimonitor choose
+  ```
+
+Wallpapers and `info.xml` land in `~/Pictures/daily-wallpapers/` unless you override with `--picturedir`.
+
+## Automatic updates (`launchd`)
+
+Create a LaunchAgent that refreshes every 30 minutes (runs at load):
 
 ```sh
 bing-wallpaper-daily-mac-multimonitor enable-auto-update [options]
@@ -41,15 +74,53 @@ Use `--auto-update-name <name>` to keep multiple schedules (one plist per name).
 bing-wallpaper-daily-mac-multimonitor disable-auto-update --auto-update-name <name>
 ```
 
-Tip: install the tool (`uv tool install ...`) before enabling auto updates so launchd has a stable binary to call.
+Tip: install first (`cargo install --path .`) so `launchd` references a stable binary path.
 
 ## Show wallpaper info
 
-After a download has run, display the Bing headline + copyright for the saved wallpaper:
+After a download, display the Bing headline and copyright for the saved wallpaper:
 
 ```sh
 bing-wallpaper-daily-mac-multimonitor info
 ```
+
+## Configuration (`~/.wallpaperconfig`)
+
+```toml
+# Default source when not set on CLI: bing | spotlight | apod
+default_source = "bing"
+
+# Target monitor (0 = all)
+monitor = 0
+
+# Name for auto-update job and saved files
+auto_update_name = "default"
+
+# Prune cache after successful run (days)
+prune_cache_days = 14
+
+# Default download directory
+picture_dir = "~/Pictures/daily-wallpapers"
+
+# Verbosity: quiet | normal | verbose
+verbosity = "normal"
+
+# Spotlight settings
+spotlight_index = 1
+
+[bing]
+country = "en-US"
+resolutions = ["1920x1200", "1920x1080", "1366x768", "UHD"]
+
+[apod]
+api_key = "your-nasa-api-key"
+crop = true
+```
+
+- CLI flags and environment variables override config values.
+- `apod.api_key` can also be provided as a top-level `apod_api_key = "..."` (backward compatibility).
+- `resolutions` apply to Bing only; Spotlight ignores them; APOD always downloads full resolution.
+- `verbosity` sets the default; `--quiet`/`--verbose` still take precedence.
 
 ## CLI options
 
@@ -83,65 +154,27 @@ bing-wallpaper-daily-mac-multimonitor info
   -h --help                      Show help.
 ```
 
-### Notes and tips
+## Notes and tips
 
 - Default resolutions are tried in order: `1920x1200`, `1920x1080`, `1024x768`, `1280x720`, `1366x768`, `UHD`.
 - Use `--auto-update-name` to run multiple schedules (different monitors, days, or countries).
-- The experimental `--all-desktops-experimental` flag writes to `~/Library/Application Support/Dock/desktoppicture.db`. If something breaks, delete that file and restart the Dock.
-- Wallpapers and `info.xml` are saved under `~/Pictures/daily-wallpapers/` unless overridden with `--picturedir`.
+- The experimental `--all-desktops-experimental` flag writes to `~/Library/Application Support/Dock/desktoppicture.db`; if something breaks, delete that file and restart the Dock.
 - For local development without installing, run `./run.sh ...` (calls `cargo run --`).
 - Spotlight ignores `--day` and always fetches the current feed; Bing respects `--day`. Same-day reruns reuse cached files unless `--force` is given.
 - APOD respects `--day`, skips non-image media, defaults to the NASA DEMO_KEY (supply your own key or set `NASA_API_KEY` to avoid rate limits), and center-crops/resizes to your primary display’s aspect ratio by default (disable with `--no-apod-crop`).
-- `choose` downloads/caches today’s Bing, Spotlight, and APOD candidates (if available), shows a list you can navigate with arrows, lets you preview with Quick Look, refresh, or apply.
+- `choose` downloads/caches today’s Bing, Spotlight, and APOD candidates (if available), lets you navigate with arrows, preview via Quick Look, refresh, or apply.
 - Use `--prune-cache-days <n>` to delete cached days older than `<n>` after a successful run.
-- Defaults can be set in `~/.wallpaperconfig` (TOML). Example:
 
-  ```toml
-  # Default source when not set on CLI: bing | spotlight | apod
-  default_source = "bing"
+## Development
 
-  # Target monitor (0 = all)
-  monitor = 0
+Run the test suite:
 
-  # Name for auto-update job and saved files
-  auto_update_name = "default"
+```sh
+cargo test
+```
 
-  # Prune cache after successful run (days)
-  prune_cache_days = 14
+## Future ideas / TODOs
+- Add instructions for new sources; evaluate making the source handling more generic.
+- Test auto-apply flows.
 
-  # Default download directory
-  picture_dir = "~/Pictures/daily-wallpapers"
-
-  # Verbosity: quiet | normal | verbose
-  verbosity = "normal"
-
-  # Spotlight settings
-  spotlight_index = 1
-
-  [bing]
-  country = "en-US"
-  resolutions = ["1920x1200", "1920x1080", "1366x768", "UHD"]
-
-  [apod]
-  api_key = "your-nasa-api-key"
-  crop = true
-  ```
-
-  Notes:
-  - CLI flags and environment variables still override config values.
-  - `api_key` can also be provided as a top-level `apod_api_key = "..."` for backward compatibility.
-  - `resolutions` apply to Bing only; Spotlight ignores them; APOD always downloads full resolution.
-  - `verbosity` sets the default; `--quiet`/`--verbose` still take precedence.
-
-## Development and tests
-
-- Run the test suite:
-
-  ```sh
-  cargo test
-  ```
-## Future Ideas
-- rename project, github repo, update authors, add attribution, license?
-- add instructions on new sources, evaluate refactoring more generic
-
-- test auto apply
+Project originally forked from https://github.com/lpikora/bing-wallpaper-daily-mac-multimonitor
