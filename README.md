@@ -122,6 +122,18 @@ crop = true
 - `resolutions` apply to Bing only; Spotlight ignores them; APOD always downloads full resolution.
 - `verbosity` sets the default; `--quiet`/`--verbose` still take precedence.
 
+## Adding a new wallpaper source (for contributors)
+
+The pipeline is already generic: sources implement `Source`, return `WallpaperCandidate`s, and are registered in `SourceRegistry`. To add a new source with minimal `src/lib.rs` churn:
+
+1) Create `src/sources/<name>.rs` implementing `Source` (follow `apod.rs`/`spotlight.rs`). Reuse helpers: `download_to_path`, `ensure_http_success`, `CacheManager::media_dir`, `SourceContext`.
+2) Register it in `SourceRegistry::new()` in `src/sources/mod.rs`.
+3) Add a `WallpaperSource` variant and wire the CLI: update `source_dir_name`, `SourceArg` + `map_source` so the CLI can select it.
+4) If it needs config, extend `AppConfig` in `src/lib.rs` and pull defaults the same way Bing/APOD/Spotlight do; keep overrides via CLI/env.
+5) Add tests (e.g., with `httpmock`) so the new source doesn’t hit real networks.
+
+All chooser/apply/cache logic is source-agnostic; new sources should not require further changes to `src/lib.rs` beyond registration and optional config wiring.
+
 ## CLI options
 
 ```
@@ -174,7 +186,6 @@ cargo test
 ```
 
 ## Future ideas / TODOs
-- Add instructions for new sources; evaluate making the source handling more generic.
 - Test auto-apply flows.
 
 Project originally forked from https://github.com/lpikora/bing-wallpaper-daily-mac-multimonitor
