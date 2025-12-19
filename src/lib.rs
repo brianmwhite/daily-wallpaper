@@ -389,27 +389,6 @@ struct Cli {
     #[arg(short = 'f', long = "force", action = ArgAction::SetTrue)]
     force: bool,
 
-    #[arg(long = "source", value_enum, default_value_t = SourceArg::Bing)]
-    source: SourceArg,
-
-    #[arg(
-        long = "spotlight-index",
-        default_value_t = 1,
-        value_parser = clap::value_parser!(usize)
-    )]
-    spotlight_index: usize,
-
-    #[arg(long = "nasa-api-key")]
-    apod_api_key: Option<String>,
-
-    #[arg(
-        long = "no-apod-crop",
-        action = ArgAction::SetFalse,
-        default_value_t = true,
-        help = "Disable APOD center-crop/resize to monitor aspect ratio"
-    )]
-    apod_crop: bool,
-
     #[arg(
         long = "prune-cache-days",
         value_parser = clap::value_parser!(u32).range(1..=365),
@@ -429,23 +408,11 @@ struct Cli {
     #[arg(short = 'v', long = "verbose", action = ArgAction::SetTrue, conflicts_with = "quiet")]
     verbose: bool,
 
-    #[arg(short = 'c', long = "country")]
-    country: Option<String>,
-
-    #[arg(short = 'd', long = "day", default_value_t = 0)]
-    day: i32,
-
     #[arg(short = 'n', long = "filename")]
     filename: Option<String>,
 
     #[arg(short = 'p', long = "picturedir")]
     picture_dir: Option<PathBuf>,
-
-    #[arg(short = 'r', long = "resolution")]
-    resolution: Option<String>,
-
-    #[arg(long = "resolutions")]
-    resolutions: Vec<String>,
 
     #[arg(short = 'm', long = "monitor", default_value_t = 0)]
     monitor: usize,
@@ -465,24 +432,7 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
     let args = Cli::parse_from(clap_args);
     let config = load_config();
 
-    if args.resolution.is_some() && !args.resolutions.is_empty() {
-        return Err(WallpaperError::Message(
-            "Provide either --resolution or --resolutions, not both.".to_string(),
-        ));
-    }
-
-    if args.spotlight_index == 0 || args.spotlight_index > SPOTLIGHT_COUNT {
-        return Err(WallpaperError::Message(format!(
-            "--spotlight-index must be between 1 and {SPOTLIGHT_COUNT}"
-        )));
-    }
-
-    let single_resolution = args.resolution.clone();
-    let mut resolutions: Vec<String> = if let Some(res) = single_resolution {
-        vec![res]
-    } else if !args.resolutions.is_empty() {
-        args.resolutions.clone()
-    } else if let Some(cfg) = &config {
+    let resolutions: Vec<String> = if let Some(cfg) = &config {
         cfg.bing
             .as_ref()
             .and_then(|b| b.resolutions.clone())
@@ -493,69 +443,60 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
     };
 
     let ssl = !args.no_ssl && args.ssl;
-    let mut source_arg = args.source;
+    let mut source_arg = SourceArg::Bing;
     if let Some(cfg) = &config {
         if let Some(def) = cfg.default_source {
             source_arg = def.into();
         }
     }
     let source = map_source(source_arg);
-    if source != WallpaperSource::Bing
-        && (!args.resolutions.is_empty() || args.resolution.is_some())
-    {
-        log(
-            "Ignoring --resolution/--resolutions for non-Bing source.",
-            args.quiet,
-        );
-    }
-
-    if source == WallpaperSource::Spotlight && args.day != 0 {
-        log(
-            "Spotlight ignores --day; using today's feed instead.",
-            args.quiet,
-        );
+    if source != WallpaperSource::Bing {
+        let config_resolutions = config
+            .as_ref()
+            .and_then(|cfg| {
+                cfg.bing
+                    .as_ref()
+                    .and_then(|b| b.resolutions.clone())
+                    .or_else(|| cfg.resolutions.clone())
+            });
+        if config_resolutions.is_some() {
+            log(
+                "Ignoring configured resolutions for non-Bing source.",
+                args.quiet,
+            );
+        }
     }
 
     let monitor_override = arg_present(&raw_args, &["-m", "--monitor"]);
-    let spotlight_override = arg_present(&raw_args, &["--spotlight-index"]);
     let auto_update_override =
         arg_present(&raw_args, &["--auto-update-name", "--auto_update_name"]);
     let prune_override = arg_present(&raw_args, &["--prune-cache-days"]);
     let picture_override = arg_present(&raw_args, &["-p", "--picturedir"]);
     let verbosity_override = args.quiet || args.verbose;
-    let country_override = arg_present(&raw_args, &["-c", "--country"]);
-    let resolution_override = !args.resolutions.is_empty() || args.resolution.is_some();
-    let apod_crop_override =
-        arg_present(&raw_args, &["--no-apod-crop"]) || arg_present(&raw_args, &["--apod-crop"]);
-
-    if let Some(cfg) = &config {
-        if !resolution_override {
-            resolutions = cfg
-                .bing
-                .as_ref()
-                .and_then(|b| b.resolutions.clone())
-                .or_else(|| cfg.resolutions.clone())
-                .unwrap_or(resolutions);
-        }
-    }
 
     let (monitor, spotlight_index) = {
         let mut monitor_val = args.monitor;
-        let mut spotlight_val = args.spotlight_index;
+        let mut spotlight_val = 1_usize;
+        if let Some(cfg) = &config {
+            if let Some(idx) = cfg.spotlight_index {
+                spotlight_val = idx;
+            }
+        }
         if let Some(cfg) = &config {
             if !monitor_override {
                 if let Some(m) = cfg.monitor {
                     monitor_val = m;
                 }
             }
-            if !spotlight_override {
-                if let Some(idx) = cfg.spotlight_index {
-                    spotlight_val = idx;
-                }
-            }
         }
         (monitor_val, spotlight_val)
     };
+
+    if spotlight_index == 0 || spotlight_index > SPOTLIGHT_COUNT {
+        return Err(WallpaperError::Message(format!(
+            "spotlight_index must be between 1 and {SPOTLIGHT_COUNT}"
+        )));
+    }
 
     let mut quiet = args.quiet;
     let mut verbose = args.verbose;
@@ -577,26 +518,18 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
         }
     }
 
-    let country = if country_override {
-        args.country.clone()
-    } else if let Some(cfg) = &config {
-        cfg.country
-            .clone()
-            .or_else(|| cfg.bing.as_ref().and_then(|b| b.country.clone()))
-    } else {
-        args.country.clone()
-    };
+    let country = config
+        .as_ref()
+        .and_then(|cfg| {
+            cfg.country
+                .clone()
+                .or_else(|| cfg.bing.as_ref().and_then(|b| b.country.clone()))
+        });
 
-    let apod_crop = if apod_crop_override {
-        args.apod_crop
-    } else if let Some(cfg) = &config {
-        cfg.apod
-            .as_ref()
-            .and_then(|a| a.crop)
-            .unwrap_or(args.apod_crop)
-    } else {
-        args.apod_crop
-    };
+    let apod_crop = config
+        .as_ref()
+        .and_then(|cfg| cfg.apod.as_ref().and_then(|a| a.crop))
+        .unwrap_or(true);
 
     let prune_cache_days = if prune_override {
         args.prune_cache_days
@@ -634,7 +567,7 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
     let settings = Settings {
         proto: if ssl { "https".into() } else { "http".into() },
         country,
-        day: args.day,
+        day: 0,
         picture_dir: picture_dir
             .unwrap_or_else(default_picture_dir)
             .expand_tilde(),
@@ -649,14 +582,9 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
         source,
         spotlight_index,
         spotlight_url_override: None,
-        apod_api_key: args
-            .apod_api_key
-            .clone()
-            .or_else(|| {
-                config
-                    .as_ref()
-                    .and_then(|c| c.apod.as_ref().and_then(|a| a.api_key.clone()))
-            })
+        apod_api_key: config
+            .as_ref()
+            .and_then(|c| c.apod.as_ref().and_then(|a| a.api_key.clone()))
             .or_else(|| load_apod_api_key_from_config())
             .or_else(|| env::var("NASA_API_KEY").ok())
             .unwrap_or_else(|| APOD_DEFAULT_KEY.to_string()),

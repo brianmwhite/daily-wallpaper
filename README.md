@@ -10,7 +10,7 @@
   [Spotlight-Downloader Public](https://github.com/ORelio/Spotlight-Downloader)
   project.
 - Multi-monitor aware with per-monitor targeting or all desktops
-- Sources: Bing Daily (default), Windows Spotlight (3 per day via `--spotlight-index`), NASA APOD (images only, optional HD, optional crop)
+- Sources: Bing Daily (default), Windows Spotlight (3 per day), NASA APOD (images only, optional HD, optional crop via config)
 - Interactive chooser with Quick Look previews
 - `launchd` integration for scheduled updates
 - Configurable defaults via `~/.wallpaperconfig` (TOML)
@@ -94,7 +94,7 @@ daily-wallpaper info
 ## Configuration (`~/.wallpaperconfig`)
 
 ```toml
-# Default source when not set on CLI: bing | spotlight | apod
+# Default source: bing | spotlight | apod
 default_source = "bing"
 
 # Target monitor (0 = all)
@@ -124,7 +124,7 @@ api_key = "your-nasa-api-key"
 crop = true
 ```
 
-- CLI flags and environment variables override config values.
+- CLI flags and environment variables override config values where applicable (e.g., `--monitor`, `--picturedir`, `NASA_API_KEY`).
 - `apod.api_key` can also be provided as a top-level `apod_api_key = "..."` (backward compatibility).
 - `resolutions` apply to Bing only; Spotlight ignores them; APOD always downloads full resolution.
 - `verbosity` sets the default; `--quiet`/`--verbose` still take precedence.
@@ -149,23 +149,14 @@ All chooser/apply/cache logic is source-agnostic; new sources should not require
   info                           Print the headline and copyright of the last download.
   choose                         Interactive picker (arrows/Enter) for Bing + Spotlight (3) + APOD; preview via Quick Look.
 
-  --source <bing|spotlight|apod> Wallpaper source (default: bing).
-  --spotlight-index <1-3>        Which Spotlight image to apply (default: 1).
-  --nasa-api-key <key>           NASA API key for APOD (default: DEMO_KEY or NASA_API_KEY env).
-  --apod-hd                      Prefer the APOD HD image when available.
-  --no-apod-crop                 Disable APOD center-crop/resize to monitor aspect ratio (default: enabled).
   --prune-cache-days <n>         After a successful run, delete cached days older than <n> days.
   --auto-update-name <name>      Name for the auto-update job (default: default).
   -f --force                     Force download even if the file already exists.
   -s --ssl                       Communicate with bing.com over HTTPS (default; use --no-ssl to opt out).
   --no-ssl                       Communicate with bing.com over HTTP (not recommended).
   -q --quiet                     Suppress log messages.
-  -c --country <country-code>    Market/region code (en-US, cs-CZ, ...).
-  -d --day <number>              Day offset (0=today, 1=yesterday...). Default: 0.
   -n --filename <file name>      Custom filename for the downloaded picture.
   -p --picturedir <picture dir>  Download directory [default: ~/Pictures/daily-wallpapers/].
-  -r --resolution <resolution>   Single resolution to try.
-  --resolutions <resolutions>    List of resolutions to try (e.g. --resolutions 1920x1200 UHD).
   -m --monitor <num>             Apply wallpaper only to a specific monitor (1,2,3...).
   --all-desktops-experimental    Write directly to desktoppicture.db for all desktops.
                                  Known issue: minimized apps are removed from Dock.
@@ -176,11 +167,10 @@ All chooser/apply/cache logic is source-agnostic; new sources should not require
 ## Notes and tips
 
 - Default resolutions are tried in order: `1920x1200`, `1920x1080`, `1024x768`, `1280x720`, `1366x768`, `UHD`.
-- Use `--auto-update-name` to run multiple schedules (different monitors, days, or countries).
+- Use `--auto-update-name` to run multiple schedules (e.g., different monitors).
 - The experimental `--all-desktops-experimental` flag writes to `~/Library/Application Support/Dock/desktoppicture.db`; if something breaks, delete that file and restart the Dock.
 - For local development without installing, run `./run.sh ...` (calls `cargo run --`).
-- Spotlight ignores `--day` and always fetches the current feed; Bing respects `--day`. Same-day reruns reuse cached files unless `--force` is given.
-- APOD respects `--day`, skips non-image media, defaults to the NASA DEMO_KEY (supply your own key or set `NASA_API_KEY` to avoid rate limits), and center-crops/resizes to your primary display’s aspect ratio by default (disable with `--no-apod-crop`).
+- APOD skips non-image media, defaults to the NASA DEMO_KEY (supply your own key or set `NASA_API_KEY` or `[apod].api_key` to avoid rate limits), and center-crops/resizes to your primary display’s aspect ratio by default (toggle with `[apod].crop` in config).
 - `choose` downloads/caches today’s Bing, Spotlight, and APOD candidates (if available), lets you navigate with arrows, preview via Quick Look, refresh, or apply.
 - Use `--prune-cache-days <n>` to delete cached days older than `<n>` after a successful run.
 
