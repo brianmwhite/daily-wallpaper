@@ -92,6 +92,7 @@ struct Settings {
     auto_update_name: String,
     monitor: usize,
     force: bool,
+    offline: bool,
     verbose: bool,
     quiet: bool,
     experimental: bool,
@@ -171,6 +172,8 @@ struct AppConfig {
     picture_dir: Option<PathBuf>,
     #[serde(default)]
     verbosity: Option<String>,
+    #[serde(default)]
+    offline: Option<bool>,
     #[serde(default)]
     spotlight_index: Option<usize>,
     #[serde(default)]
@@ -386,6 +389,9 @@ struct Cli {
     #[arg(short = 'v', long = "verbose", action = ArgAction::SetTrue, conflicts_with = "quiet")]
     verbose: bool,
 
+    #[arg(long = "offline", action = ArgAction::SetTrue, help = "Use cached wallpapers only; never download.")]
+    offline: bool,
+
     #[arg(short = 'n', long = "filename")]
     filename: Option<String>,
 
@@ -425,6 +431,7 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
     let prune_override = arg_present(&raw_args, &["--prune-cache-days"]);
     let picture_override = arg_present(&raw_args, &["-p", "--picturedir"]);
     let verbosity_override = args.quiet || args.verbose;
+    let offline_override = arg_present(&raw_args, &["--offline"]);
 
     let monitor = {
         let mut monitor_val = args.monitor;
@@ -457,6 +464,13 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
                     _ => {}
                 }
             }
+        }
+    }
+
+    let mut offline = args.offline;
+    if !offline_override {
+        if let Some(cfg) = &config {
+            offline = cfg.offline.unwrap_or(offline);
         }
     }
 
@@ -501,6 +515,7 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
         auto_update_name: normalize_auto_update_name(&auto_update_name),
         monitor,
         force: args.force,
+        offline,
         verbose,
         quiet,
         experimental,
@@ -508,6 +523,13 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
         source,
         prune_cache_days,
     };
+
+    if settings.offline && settings.force {
+        log(
+            "Offline mode enabled; ignoring --force for downloads.",
+            settings.quiet,
+        );
+    }
 
     let cache = CacheManager::new(&settings.picture_dir);
     let client = build_client()?;
@@ -891,6 +913,11 @@ fn download_to_path(
     target_path: &Path,
     settings: &Settings,
 ) -> Result<DownloadedFile> {
+    if settings.offline {
+        return Err(WallpaperError::Message(
+            "Offline mode is enabled; downloads are disabled.".to_string(),
+        ));
+    }
     if target_path.exists() && !settings.force {
         log_verbose(
             &format!(
@@ -1363,13 +1390,14 @@ mod tests {
     fn make_settings(tmpdir: &Path, filename: Option<&str>, force: bool) -> Settings {
         Settings {
             proto: "https".into(),
-            picture_dir: tmpdir.to_path_buf(),
-            auto_update_name: "default".into(),
-            monitor: 0,
-            force,
-            verbose: false,
-            quiet: true,
-            experimental: false,
+        picture_dir: tmpdir.to_path_buf(),
+        auto_update_name: "default".into(),
+        monitor: 0,
+        force,
+        offline: false,
+        verbose: false,
+        quiet: true,
+        experimental: false,
             filename: filename.map(ToString::to_string),
             source: WallpaperSource::Bing,
             prune_cache_days: None,
@@ -1687,6 +1715,127 @@ mod tests {
         .unwrap();
         assert_eq!(api_mock.hits(), 1);
         assert_eq!(img_mock.hits(), 1);
+    }
+
+    #[test]
+    fn apod_offline_reuses_cache_without_network() {
+        let server = MockServer::start();
+        let api_url = server.url("/apod");
+        let img_url = server.url("/image.jpg");
+
+        let api_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/apod")
+                .query_param("api_key", "TEST")
+                .query_param("date", "2024-01-03");
+            then.status(200).body(
+                r#"{
+                "url":"IMAGE_URL",
+                "media_type":"image",
+                "title":"Nebula 2",
+                "explanation":"desc 2"
+            }"#
+                .replace("IMAGE_URL", &img_url),
+            );
+        });
+        let img_mock = server.mock(|when, then| {
+            when.method(GET).path("/image.jpg");
+            then.status(200).body("img-bytes-2");
+        });
+
+        let tmpdir = tempdir().unwrap();
+        let mut settings = make_settings(tmpdir.path(), None, false);
+        settings.source = WallpaperSource::Apod;
+        let mut source_settings = SourceSettings::from_config(None).unwrap();
+        source_settings.apod.api_key = "TEST".into();
+        source_settings.apod.url_override = Some(api_url);
+        source_settings.apod.crop = false;
+
+        let cache = CacheManager::new(tmpdir.path());
+        let client = build_client().unwrap();
+        let date_label = "2024-01-03";
+
+        run_source_for_test(
+            WallpaperSource::Apod,
+            &client,
+            &cache,
+            &settings,
+            date_label,
+            &source_settings,
+        )
+        .unwrap();
+        assert_eq!(api_mock.hits(), 1);
+        assert_eq!(img_mock.hits(), 1);
+
+        settings.offline = true;
+        settings.force = true;
+
+        run_source_for_test(
+            WallpaperSource::Apod,
+            &client,
+            &cache,
+            &settings,
+            date_label,
+            &source_settings,
+        )
+        .unwrap();
+        assert_eq!(api_mock.hits(), 1, "metadata fetch must be skipped offline");
+        assert_eq!(img_mock.hits(), 1, "image download must be skipped offline");
+    }
+
+    #[test]
+    fn apod_offline_errors_without_cache() {
+        let server = MockServer::start();
+        let api_url = server.url("/apod");
+        let img_url = server.url("/image.jpg");
+
+        let api_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/apod")
+                .query_param("api_key", "TEST")
+                .query_param("date", "2024-01-04");
+            then.status(200).body(
+                r#"{
+                "url":"IMAGE_URL",
+                "media_type":"image",
+                "title":"Nebula 3",
+                "explanation":"desc 3"
+            }"#
+                .replace("IMAGE_URL", &img_url),
+            );
+        });
+        let img_mock = server.mock(|when, then| {
+            when.method(GET).path("/image.jpg");
+            then.status(200).body("img-bytes-3");
+        });
+
+        let tmpdir = tempdir().unwrap();
+        let mut settings = make_settings(tmpdir.path(), None, false);
+        settings.source = WallpaperSource::Apod;
+        settings.offline = true;
+        settings.force = true;
+        let mut source_settings = SourceSettings::from_config(None).unwrap();
+        source_settings.apod.api_key = "TEST".into();
+        source_settings.apod.url_override = Some(api_url);
+        source_settings.apod.crop = false;
+
+        let cache = CacheManager::new(tmpdir.path());
+        let client = build_client().unwrap();
+        let date_label = "2024-01-04";
+
+        let err = run_source_for_test(
+            WallpaperSource::Apod,
+            &client,
+            &cache,
+            &settings,
+            date_label,
+            &source_settings,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("Offline mode enabled"));
+        assert_eq!(api_mock.hits(), 0);
+        assert_eq!(img_mock.hits(), 0);
     }
 
     #[test]

@@ -118,23 +118,27 @@ pub(crate) fn fetch_bing_candidate(
     bing_settings: &BingSettings,
     resolutions: Vec<String>,
 ) -> Result<FetchedCandidate> {
-    if !settings.force {
-        if let Some(candidate) = cache.find_candidate(date_label, WallpaperSource::Bing)? {
-            if candidate.local_path.exists() {
-                log_verbose(
-                    &format!(
-                        "Using cached wallpaper for {} from {:?}",
-                        date_label, candidate.source
-                    ),
-                    settings,
-                );
-                ensure_info_file(&settings.picture_dir, &candidate)?;
-                return Ok(FetchedCandidate {
-                    candidate,
-                    skipped_download: true,
-                });
-            }
+    if let Some(candidate) = cache.find_candidate(date_label, WallpaperSource::Bing)? {
+        if candidate.local_path.exists() && (!settings.force || settings.offline) {
+            log_verbose(
+                &format!(
+                    "Using cached wallpaper for {} from {:?}",
+                    date_label, candidate.source
+                ),
+                settings,
+            );
+            ensure_info_file(&settings.picture_dir, &candidate)?;
+            return Ok(FetchedCandidate {
+                candidate,
+                skipped_download: true,
+            });
         }
+    }
+
+    if settings.offline {
+        return Err(WallpaperError::Message(format!(
+            "Offline mode enabled; no cached Bing wallpaper for {date_label}."
+        )));
     }
 
     let archive_url = build_archive_url(bing_settings.day, bing_settings.country.as_deref());

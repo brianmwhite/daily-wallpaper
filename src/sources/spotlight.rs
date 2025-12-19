@@ -172,17 +172,23 @@ pub(crate) fn fetch_spotlight_candidates(
     date_label: &str,
     spotlight_settings: &SpotlightSettings,
 ) -> Result<Vec<WallpaperCandidate>> {
-    if !settings.force {
-        if let Some(index) = cache.load_index(date_label)? {
-            let existing: Vec<_> = index
-                .candidates
-                .into_iter()
-                .filter(|c| c.source == WallpaperSource::Spotlight && c.local_path.exists())
-                .collect();
-            if !existing.is_empty() {
-                return Ok(existing);
-            }
-        }
+    let cached_candidates = if let Some(index) = cache.load_index(date_label)? {
+        index
+            .candidates
+            .into_iter()
+            .filter(|c| c.source == WallpaperSource::Spotlight && c.local_path.exists())
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    if !cached_candidates.is_empty() && (!settings.force || settings.offline) {
+        return Ok(cached_candidates);
+    }
+
+    if settings.offline {
+        return Err(WallpaperError::Message(format!(
+            "Offline mode enabled; no cached Spotlight images for {date_label}."
+        )));
     }
 
     let url = build_spotlight_url(spotlight_settings);

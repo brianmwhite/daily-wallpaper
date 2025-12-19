@@ -112,6 +112,9 @@ picture_dir = "~/Pictures/daily-wallpapers"
 # Verbosity: quiet | normal | verbose
 verbosity = "normal"
 
+# Cache-only mode; skip network and reuse existing downloads
+offline = false
+
 # Spotlight settings
 spotlight_index = 1
 
@@ -150,6 +153,7 @@ All chooser/apply/cache logic is source-agnostic; new sources should not require
   choose                         Interactive picker (arrows/Enter) for Bing + Spotlight (3) + APOD; preview via Quick Look.
 
   --prune-cache-days <n>         After a successful run, delete cached days older than <n> days.
+  --offline                      Use cached wallpapers only; never download or hit the network.
   --auto-update-name <name>      Name for the auto-update job (default: default).
   -f --force                     Force download even if the file already exists.
   -s --ssl                       Communicate with bing.com over HTTPS (default; use --no-ssl to opt out).
@@ -173,6 +177,7 @@ All chooser/apply/cache logic is source-agnostic; new sources should not require
 - APOD skips non-image media, defaults to the NASA DEMO_KEY (supply your own key or set `NASA_API_KEY` or `[apod].api_key` to avoid rate limits), and center-crops/resizes to your primary display’s aspect ratio by default (toggle with `[apod].crop` in config).
 - `choose` downloads/caches today’s Bing, Spotlight, and APOD candidates (if available), lets you navigate with arrows, preview via Quick Look, refresh, or apply.
 - Use `--prune-cache-days <n>` to delete cached days older than `<n>` after a successful run.
+- Use `--offline` or `offline = true` in `~/.wallpaperconfig` to reuse cached wallpapers and avoid all network calls.
 
 ## Development
 

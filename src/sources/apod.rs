@@ -121,16 +121,20 @@ pub(crate) fn fetch_apod_candidate(
     apod_settings: &ApodSettings,
 ) -> Result<WallpaperCandidate> {
     let candidate_id = format!("apod-{date_label}");
-    if !settings.force {
-        if let Some(candidate) = cache.find_candidate_by_id(date_label, &candidate_id)? {
-            if candidate.local_path.exists() {
-                log_verbose(
-                    &format!("Using cached APOD wallpaper for {}", date_label),
-                    settings,
-                );
-                return Ok(candidate);
-            }
+    if let Some(candidate) = cache.find_candidate_by_id(date_label, &candidate_id)? {
+        if candidate.local_path.exists() && (!settings.force || settings.offline) {
+            log_verbose(
+                &format!("Using cached APOD wallpaper for {}", date_label),
+                settings,
+            );
+            return Ok(candidate);
         }
+    }
+
+    if settings.offline {
+        return Err(WallpaperError::Message(format!(
+            "Offline mode enabled; no cached APOD wallpaper for {date_label}."
+        )));
     }
 
     let apod = fetch_apod(client, settings, apod_settings, date_label)?;
