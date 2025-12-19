@@ -14,10 +14,13 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::collections::HashSet;
 use thiserror::Error;
 
 mod sources;
 use sources::{Source, SourceContext, SourceRegistry, SourceSettings};
+mod favorites;
+use favorites::{FavoriteEntry, FavoritesManager};
 
 const DEFAULT_RESOLUTIONS: &[&str] = &[
     "1920x1200",
@@ -89,6 +92,7 @@ pub enum WallpaperError {
 struct Settings {
     proto: String,
     picture_dir: PathBuf,
+    favorites_dir: PathBuf,
     auto_update_name: String,
     monitor: usize,
     force: bool,
@@ -170,6 +174,8 @@ struct AppConfig {
     prune_cache_days: Option<u32>,
     #[serde(default)]
     picture_dir: Option<PathBuf>,
+    #[serde(default)]
+    favorites_dir: Option<PathBuf>,
     #[serde(default)]
     verbosity: Option<String>,
     #[serde(default)]
@@ -490,6 +496,12 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
         args.picture_dir.clone()
     };
 
+    let favorites_dir = if let Some(cfg) = &config {
+        cfg.favorites_dir.clone()
+    } else {
+        None
+    };
+
     let auto_update_name = if auto_update_override {
         args.auto_update_name.clone()
     } else if let Some(cfg) = &config {
@@ -507,11 +519,17 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
         args.all_desktops_experimental
     };
 
+    let resolved_picture_dir = picture_dir
+        .unwrap_or_else(default_picture_dir)
+        .expand_tilde();
+    let resolved_favorites_dir = favorites_dir
+        .unwrap_or_else(|| default_favorites_dir(&resolved_picture_dir))
+        .expand_tilde();
+
     let settings = Settings {
         proto: if ssl { "https".into() } else { "http".into() },
-        picture_dir: picture_dir
-            .unwrap_or_else(default_picture_dir)
-            .expand_tilde(),
+        picture_dir: resolved_picture_dir,
+        favorites_dir: resolved_favorites_dir,
         auto_update_name: normalize_auto_update_name(&auto_update_name),
         monitor,
         force: args.force,
@@ -532,6 +550,7 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
     }
 
     let cache = CacheManager::new(&settings.picture_dir);
+    let favorites = FavoritesManager::new(settings.favorites_dir.clone());
     let client = build_client()?;
     let registry = SourceRegistry::new();
 
@@ -554,7 +573,15 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
         }
         Some(CommandArg::Choose) => {
             ensure_picture_dir(&settings.picture_dir)?;
-            return run_choose(&client, &cache, &registry, &settings, &source_settings);
+            ensure_picture_dir(&settings.favorites_dir)?;
+            return run_choose(
+                &client,
+                &cache,
+                &favorites,
+                &registry,
+                &settings,
+                &source_settings,
+            );
         }
         Some(CommandArg::Reapply) => {
             ensure_picture_dir(&settings.picture_dir)?;
@@ -595,6 +622,10 @@ fn build_client() -> Result<Client> {
 
 fn default_picture_dir() -> PathBuf {
     home_dir().join("Pictures").join("daily-wallpapers")
+}
+
+fn default_favorites_dir(picture_dir: &Path) -> PathBuf {
+    picture_dir.join("favorites")
 }
 
 fn home_dir() -> PathBuf {
@@ -743,6 +774,7 @@ fn require_source<'a>(registry: &'a SourceRegistry, id: WallpaperSource) -> Resu
 fn run_choose(
     client: &Client,
     cache: &CacheManager,
+    favorites: &FavoritesManager,
     registry: &SourceRegistry,
     settings: &Settings,
     source_settings: &SourceSettings,
@@ -751,17 +783,22 @@ fn run_choose(
     let mut selected_idx: Option<usize> = None;
 
     loop {
+        let favorite_entries = favorites.load_all()?;
+        let favorite_ids: HashSet<String> = favorite_entries
+            .iter()
+            .map(|f| f.id.clone())
+            .collect();
         let candidates =
             gather_candidates(client, cache, registry, &current_settings, source_settings)?;
         // Force should be one-shot in the chooser to avoid repeated re-downloads.
         current_settings.force = false;
-        if candidates.is_empty() {
+        if candidates.is_empty() && favorite_entries.is_empty() {
             return Err(WallpaperError::Message(
                 "No wallpapers available to choose from.".to_string(),
             ));
         }
 
-        let labels: Vec<String> = candidates
+        let mut labels: Vec<String> = candidates
             .iter()
             .enumerate()
             .map(|(idx, cand)| {
@@ -775,52 +812,72 @@ fn run_choose(
                     .as_deref()
                     .filter(|t| !t.is_empty())
                     .unwrap_or("");
+                let favorite_marker = if favorite_ids.contains(&cand.id) {
+                    " [fav]"
+                } else {
+                    ""
+                };
                 format!(
-                    "{idx}: [{}] {}{}",
+                    "{}: [{}] {}{}{}",
+                    idx + 1,
                     source_label(cand.source),
                     title,
                     if attribution.is_empty() {
                         "".to_string()
                     } else {
                         format!(" — {}", attribution)
-                    }
+                    },
+                    favorite_marker
                 )
             })
             .collect();
+        labels.push(format!(
+            "{}: Favorites ({})",
+            candidates.len() + 1,
+            favorite_entries.len()
+        ));
 
+        let labels_for_prompt = labels.clone();
         let selection = Select::new(
             "Select a wallpaper (arrows + Enter). Choose Preview/Apply next.",
-            labels,
+            labels_for_prompt,
         )
         .with_starting_cursor(selected_idx.unwrap_or(0))
         .prompt();
 
-        let idx = match selection {
+        let (idx, _selected_label) = match selection {
             Ok(label) => {
-                // labels are formatted as "{idx}: ..."
-                let parts: Vec<&str> = label.split(':').collect();
-                if let Some(num_str) = parts.first() {
-                    num_str.parse::<usize>().unwrap_or(0)
-                } else {
-                    0
-                }
+                let pos = labels.iter().position(|l| l == &label).unwrap_or(0);
+                (pos, label)
             }
             Err(_) => return Ok(()),
         };
-        selected_idx = Some(idx);
+        selected_idx = Some(idx.min(labels.len().saturating_sub(1)));
+
+        if idx == candidates.len() {
+            if favorite_entries.is_empty() {
+                println!("No favorites saved yet.");
+                continue;
+            }
+            run_favorites_menu(&favorite_entries, favorites, cache, &current_settings)?;
+            continue;
+        }
 
         if let Some(cand) = candidates.get(idx) {
             let mut action_cursor = 0_usize;
             loop {
-                let action = Select::new(
-                    "Action",
-                    vec![
-                        "Preview (Quick Look)",
-                        "Apply",
-                        "Refresh list (force re-download)",
-                        "Quit chooser",
-                    ],
-                )
+                let mut actions = vec![
+                    "Preview (Quick Look)".to_string(),
+                    "Apply".to_string(),
+                    "Favorite".to_string(),
+                    "Refresh list (force re-download)".to_string(),
+                    "Quit chooser".to_string(),
+                ];
+                if favorite_ids.contains(&cand.id) {
+                    actions[2] = "Favorite (already saved)".to_string();
+                }
+
+                let action = Select::new("Action", actions)
                 .with_starting_cursor(action_cursor)
                 .prompt();
                 match action {
@@ -852,6 +909,14 @@ fn run_choose(
                             Err(err) => println!("Failed to apply wallpaper: {err}"),
                         }
                     }
+                    Ok(choice) if choice.starts_with("Favorite") => {
+                        match favorites.save_favorite(cand) {
+                            Ok(_) => println!("Saved to favorites."),
+                            Err(err) => println!("Could not favorite: {err}"),
+                        }
+                        // Refresh favorites on next loop.
+                        break;
+                    }
                     Ok(choice) if choice.starts_with("Refresh") => {
                         current_settings.force = true;
                         break;
@@ -860,6 +925,123 @@ fn run_choose(
                     Err(InquireError::OperationCanceled) => break,
                     _ => return Ok(()),
                 }
+            }
+        }
+    }
+}
+
+fn run_favorites_menu(
+    favorites: &[FavoriteEntry],
+    manager: &FavoritesManager,
+    cache: &CacheManager,
+    settings: &Settings,
+) -> Result<()> {
+    let mut fav_cursor: usize = 0;
+    loop {
+        if favorites.is_empty() {
+            println!("No favorites saved yet.");
+            return Ok(());
+        }
+        let labels: Vec<String> = favorites
+            .iter()
+            .enumerate()
+            .map(|(idx, fav)| {
+                let title = fav
+                    .title
+                    .as_deref()
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or("(no title)");
+                let attribution = fav
+                    .attribution
+                    .as_deref()
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or("");
+                format!(
+                    "{idx}: [{}] {}{}",
+                    source_label(fav.source),
+                    title,
+                    if attribution.is_empty() {
+                        "".to_string()
+                    } else {
+                        format!(" — {}", attribution)
+                    }
+                )
+            })
+            .collect();
+
+        let selection = Select::new("Select a favorite", labels)
+            .with_starting_cursor(fav_cursor)
+            .prompt();
+
+        let idx = match selection {
+            Ok(label) => {
+                let parts: Vec<&str> = label.split(':').collect();
+                if let Some(num_str) = parts.first() {
+                    num_str.parse::<usize>().unwrap_or(0)
+                } else {
+                    0
+                }
+            }
+            Err(_) => return Ok(()),
+        };
+        fav_cursor = idx;
+        let Some(fav) = favorites.get(idx) else {
+            continue;
+        };
+
+        let mut action_cursor = 0_usize;
+        loop {
+            let action = Select::new(
+                "Action",
+                vec![
+                    "Preview (Quick Look)",
+                    "Apply",
+                    "Remove from favorites",
+                    "Back",
+                ],
+            )
+            .with_starting_cursor(action_cursor)
+            .prompt();
+
+            match action {
+                Ok(choice) if choice.starts_with("Preview") => {
+                    if fav.image_path.exists() {
+                        let path_str = fav.image_path.to_string_lossy().to_string();
+                        let _ = run_checked("qlmanage", &["-p", &path_str], "Quick Look preview");
+                    } else {
+                        println!("Favorite image not found: {}", fav.image_path.display());
+                    }
+                    action_cursor = 1;
+                    continue;
+                }
+                Ok(choice) if choice.starts_with("Apply") => {
+                    if !fav.image_path.exists() {
+                        println!("Favorite image not found: {}", fav.image_path.display());
+                        break;
+                    }
+                    match apply_wallpaper(
+                        &fav.image_path,
+                        settings,
+                        cache,
+                        &fav.id,
+                        fav.source,
+                        Some(&fav.date),
+                    ) {
+                        Ok(()) => return Ok(()),
+                        Err(err) => println!("Failed to apply wallpaper: {err}"),
+                    }
+                }
+                Ok(choice) if choice.starts_with("Remove") => {
+                    if let Err(err) = manager.remove(fav) {
+                        println!("Failed to remove favorite: {err}");
+                    } else {
+                        println!("Removed from favorites.");
+                    }
+                    return Ok(());
+                }
+                Ok(choice) if choice.starts_with("Back") => break,
+                Err(InquireError::OperationCanceled) => break,
+                _ => return Ok(()),
             }
         }
     }
@@ -1383,14 +1565,16 @@ impl ExpandTilde for PathBuf {
 mod tests {
     use super::*;
     use crate::sources::bing;
+    use crate::favorites::FavoritesManager;
     use httpmock::Method::GET;
     use httpmock::MockServer;
     use tempfile::tempdir;
 
     fn make_settings(tmpdir: &Path, filename: Option<&str>, force: bool) -> Settings {
         Settings {
-            proto: "https".into(),
+        proto: "https".into(),
         picture_dir: tmpdir.to_path_buf(),
+        favorites_dir: tmpdir.join("favorites"),
         auto_update_name: "default".into(),
         monitor: 0,
         force,
@@ -1982,5 +2166,63 @@ mod tests {
         let err = show_info(&cache, &mut buffer).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("previously applied wallpaper"));
+    }
+
+    fn dummy_candidate(tmpdir: &Path, id: &str) -> WallpaperCandidate {
+        let img_path = tmpdir.join(format!("{id}.png"));
+        let buffer = image::ImageBuffer::from_pixel(10, 10, image::Rgba([1u8, 2u8, 3u8, 255u8]));
+        buffer
+            .save_with_format(&img_path, image::ImageFormat::Png)
+            .unwrap();
+        WallpaperCandidate {
+            id: id.to_string(),
+            source: WallpaperSource::Bing,
+            title: Some("Title".into()),
+            description: Some("Desc".into()),
+            attribution: Some("Attr".into()),
+            info_url: Some("https://example.com/info".into()),
+            image_url: "https://example.com/img.jpg".into(),
+            local_path: img_path,
+            date: "2024-01-01".into(),
+            metadata_xml: Some("<xml>meta</xml>".into()),
+        }
+    }
+
+    #[test]
+    fn favorites_save_load_and_remove() {
+        let tmpdir = tempdir().unwrap();
+        let favorites_dir = tmpdir.path().join("favorites");
+        let manager = FavoritesManager::new(favorites_dir.clone());
+        let candidate = dummy_candidate(tmpdir.path(), "fav1");
+
+        let saved = manager.save_favorite(&candidate).unwrap();
+        assert!(saved.image_path.exists());
+        let stem = Path::new(&saved.stored_filename)
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert!(favorites_dir.join(format!("{stem}.json")).exists());
+
+        let loaded = manager.load_all().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, candidate.id);
+        assert!(loaded[0].image_path.exists());
+
+        manager.remove(&loaded[0]).unwrap();
+        let after = manager.load_all().unwrap();
+        assert!(after.is_empty());
+    }
+
+    #[test]
+    fn favorites_prevent_duplicates() {
+        let tmpdir = tempdir().unwrap();
+        let manager = FavoritesManager::new(tmpdir.path().join("favorites"));
+        let candidate = dummy_candidate(tmpdir.path(), "dup");
+
+        manager.save_favorite(&candidate).unwrap();
+        let err = manager.save_favorite(&candidate).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("already in favorites"));
     }
 }

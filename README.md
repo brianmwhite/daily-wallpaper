@@ -109,6 +109,9 @@ prune_cache_days = 14
 # Default download directory
 picture_dir = "~/Pictures/daily-wallpapers"
 
+# Favorites directory (defaults to <picture_dir>/favorites)
+favorites_dir = "~/Pictures/daily-wallpapers/favorites"
+
 # Verbosity: quiet | normal | verbose
 verbosity = "normal"
 
@@ -151,6 +154,7 @@ All chooser/apply/cache logic is source-agnostic; new sources should not require
   disable-auto-update            Unload and remove the launchd plist.
   info                           Print the headline and copyright of the last download.
   choose                         Interactive picker (arrows/Enter) for Bing + Spotlight (3) + APOD; preview via Quick Look.
+                                 Also includes a Favorites list for saved wallpapers.
 
   --prune-cache-days <n>         After a successful run, delete cached days older than <n> days.
   --offline                      Use cached wallpapers only; never download or hit the network.
@@ -178,6 +182,7 @@ All chooser/apply/cache logic is source-agnostic; new sources should not require
 - `choose` downloads/caches today’s Bing, Spotlight, and APOD candidates (if available), lets you navigate with arrows, preview via Quick Look, refresh, or apply.
 - Use `--prune-cache-days <n>` to delete cached days older than `<n>` after a successful run.
 - Use `--offline` or `offline = true` in `~/.wallpaperconfig` to reuse cached wallpapers and avoid all network calls.
+- Favorites: inside the `choose` flow, you can mark a candidate as a favorite (copies image + per-file metadata into `favorites_dir`) and browse/apply/remove favorites via the `Favorites` option. Favorites are offline-friendly and not pruned.
 
 ## Development
 
