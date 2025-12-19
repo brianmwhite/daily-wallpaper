@@ -8,6 +8,58 @@ use std::fs;
 
 use super::{FetchResult, Source, SourceContext};
 
+#[derive(Debug, Clone)]
+pub struct SpotlightSettings {
+    pub index: usize,
+    pub country: Option<String>,
+    pub url_override: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, Clone)]
+pub struct SpotlightConfig {
+    #[serde(default)]
+    pub index: Option<usize>,
+    #[serde(default)]
+    pub country: Option<String>,
+    #[serde(default)]
+    pub url_override: Option<String>,
+}
+
+impl SpotlightSettings {
+    pub fn from_config(config: Option<&crate::AppConfig>) -> crate::Result<Self> {
+        let (index, country, url_override) = if let Some(cfg) = config {
+            (
+                cfg.spotlight
+                    .as_ref()
+                    .and_then(|c| c.index)
+                    .or(cfg.spotlight_index)
+                    .unwrap_or(1),
+                cfg.spotlight
+                    .as_ref()
+                    .and_then(|c| c.country.clone())
+                    .or(cfg.country.clone()),
+                cfg.spotlight
+                    .as_ref()
+                    .and_then(|c| c.url_override.clone()),
+            )
+        } else {
+            (1, None, None)
+        };
+
+        if index == 0 || index > SPOTLIGHT_COUNT {
+            return Err(crate::WallpaperError::Message(format!(
+                "spotlight_index must be between 1 and {SPOTLIGHT_COUNT}"
+            )));
+        }
+
+        Ok(Self {
+            index,
+            country,
+            url_override,
+        })
+    }
+}
+
 pub struct SpotlightSource;
 
 pub const SPOTLIGHT_URL: &str = "https://fd.api.iris.microsoft.com/v4/api/selection";
@@ -33,8 +85,13 @@ impl Source for SpotlightSource {
     }
 
     fn fetch(&self, ctx: &SourceContext<'_>) -> Result<FetchResult> {
-        let candidates =
-            fetch_spotlight_candidates(ctx.client, ctx.cache, ctx.settings, ctx.date_label)?;
+        let candidates = fetch_spotlight_candidates(
+            ctx.client,
+            ctx.cache,
+            ctx.settings,
+            ctx.date_label,
+            &ctx.source_settings.spotlight,
+        )?;
         Ok(FetchResult {
             candidates,
             skipped_download: false,
@@ -44,13 +101,13 @@ impl Source for SpotlightSource {
     fn pick_default<'a>(
         &self,
         candidates: &'a [WallpaperCandidate],
-        settings: &Settings,
+        ctx: &SourceContext<'_>,
     ) -> Result<&'a WallpaperCandidate> {
-        let idx = settings.spotlight_index.saturating_sub(1);
+        let idx = ctx.source_settings.spotlight.index.saturating_sub(1);
         candidates.get(idx).ok_or_else(|| {
             WallpaperError::Message(format!(
                 "Requested Spotlight index {} not available; {} images found.",
-                settings.spotlight_index,
+                ctx.source_settings.spotlight.index,
                 candidates.len()
             ))
         })
@@ -113,6 +170,7 @@ pub(crate) fn fetch_spotlight_candidates(
     cache: &CacheManager,
     settings: &Settings,
     date_label: &str,
+    spotlight_settings: &SpotlightSettings,
 ) -> Result<Vec<WallpaperCandidate>> {
     if !settings.force {
         if let Some(index) = cache.load_index(date_label)? {
@@ -127,7 +185,7 @@ pub(crate) fn fetch_spotlight_candidates(
         }
     }
 
-    let url = build_spotlight_url(settings);
+    let url = build_spotlight_url(spotlight_settings);
     log_verbose(&format!("Fetching Spotlight feed: {}", url), settings);
     let response = client.get(url.clone()).timeout(METADATA_TIMEOUT).send()?;
     ensure_http_success(response.status(), &url)?;
@@ -180,8 +238,8 @@ pub(crate) fn fetch_spotlight_candidates(
     Ok(candidates)
 }
 
-pub(crate) fn build_spotlight_url(settings: &Settings) -> String {
-    if let Some(override_url) = &settings.spotlight_url_override {
+pub(crate) fn build_spotlight_url(settings: &SpotlightSettings) -> String {
+    if let Some(override_url) = &settings.url_override {
         return override_url.clone();
     }
     let (country, locale) = match &settings.country {

@@ -17,9 +17,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 mod sources;
-use sources::apod::APOD_DEFAULT_KEY;
-use sources::spotlight::SPOTLIGHT_COUNT;
-use sources::{Source, SourceContext, SourceRegistry};
+use sources::{Source, SourceContext, SourceRegistry, SourceSettings};
 
 const DEFAULT_RESOLUTIONS: &[&str] = &[
     "1920x1200",
@@ -90,8 +88,6 @@ pub enum WallpaperError {
 #[derive(Debug, Clone)]
 struct Settings {
     proto: String,
-    country: Option<String>,
-    day: i32,
     picture_dir: PathBuf,
     auto_update_name: String,
     monitor: usize,
@@ -100,13 +96,7 @@ struct Settings {
     quiet: bool,
     experimental: bool,
     filename: Option<String>,
-    bing_host: String,
     source: WallpaperSource,
-    spotlight_index: usize,
-    spotlight_url_override: Option<String>,
-    apod_api_key: String,
-    apod_url_override: Option<String>,
-    apod_crop: bool,
     prune_cache_days: Option<u32>,
 }
 
@@ -166,27 +156,9 @@ struct CacheIndex {
 }
 
 #[derive(Debug, Default, Deserialize, Clone)]
-struct ApodConfig {
-    #[serde(default)]
-    api_key: Option<String>,
-    #[serde(default)]
-    crop: Option<bool>,
-}
-
-#[derive(Debug, Default, Deserialize, Clone)]
-struct BingConfig {
-    #[serde(default)]
-    country: Option<String>,
-    #[serde(default)]
-    resolutions: Option<Vec<String>>,
-}
-
-#[derive(Debug, Default, Deserialize, Clone)]
 struct AppConfig {
     #[serde(default)]
     default_source: Option<ConfigSource>,
-    #[serde(default)]
-    spotlight_index: Option<usize>,
     #[serde(default)]
     monitor: Option<usize>,
     #[serde(default)]
@@ -200,13 +172,19 @@ struct AppConfig {
     #[serde(default)]
     verbosity: Option<String>,
     #[serde(default)]
+    spotlight_index: Option<usize>,
+    #[serde(default)]
+    apod_api_key: Option<String>,
+    #[serde(default)]
     country: Option<String>,
     #[serde(default)]
     resolutions: Option<Vec<String>>,
     #[serde(default)]
-    apod: Option<ApodConfig>,
+    apod: Option<sources::apod::ApodConfig>,
     #[serde(default)]
-    bing: Option<BingConfig>,
+    bing: Option<sources::bing::BingConfig>,
+    #[serde(default)]
+    spotlight: Option<sources::spotlight::SpotlightConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -432,16 +410,6 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
     let args = Cli::parse_from(clap_args);
     let config = load_config();
 
-    let resolutions: Vec<String> = if let Some(cfg) = &config {
-        cfg.bing
-            .as_ref()
-            .and_then(|b| b.resolutions.clone())
-            .or_else(|| cfg.resolutions.clone())
-            .unwrap_or_else(|| DEFAULT_RESOLUTIONS.iter().map(|s| s.to_string()).collect())
-    } else {
-        DEFAULT_RESOLUTIONS.iter().map(|s| s.to_string()).collect()
-    };
-
     let ssl = !args.no_ssl && args.ssl;
     let mut source_arg = SourceArg::Bing;
     if let Some(cfg) = &config {
@@ -450,22 +418,6 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
         }
     }
     let source = map_source(source_arg);
-    if source != WallpaperSource::Bing {
-        let config_resolutions = config
-            .as_ref()
-            .and_then(|cfg| {
-                cfg.bing
-                    .as_ref()
-                    .and_then(|b| b.resolutions.clone())
-                    .or_else(|| cfg.resolutions.clone())
-            });
-        if config_resolutions.is_some() {
-            log(
-                "Ignoring configured resolutions for non-Bing source.",
-                args.quiet,
-            );
-        }
-    }
 
     let monitor_override = arg_present(&raw_args, &["-m", "--monitor"]);
     let auto_update_override =
@@ -474,14 +426,8 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
     let picture_override = arg_present(&raw_args, &["-p", "--picturedir"]);
     let verbosity_override = args.quiet || args.verbose;
 
-    let (monitor, spotlight_index) = {
+    let monitor = {
         let mut monitor_val = args.monitor;
-        let mut spotlight_val = 1_usize;
-        if let Some(cfg) = &config {
-            if let Some(idx) = cfg.spotlight_index {
-                spotlight_val = idx;
-            }
-        }
         if let Some(cfg) = &config {
             if !monitor_override {
                 if let Some(m) = cfg.monitor {
@@ -489,14 +435,10 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
                 }
             }
         }
-        (monitor_val, spotlight_val)
+        monitor_val
     };
 
-    if spotlight_index == 0 || spotlight_index > SPOTLIGHT_COUNT {
-        return Err(WallpaperError::Message(format!(
-            "spotlight_index must be between 1 and {SPOTLIGHT_COUNT}"
-        )));
-    }
+    let source_settings = SourceSettings::from_config(config.as_ref())?;
 
     let mut quiet = args.quiet;
     let mut verbose = args.verbose;
@@ -517,19 +459,6 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
             }
         }
     }
-
-    let country = config
-        .as_ref()
-        .and_then(|cfg| {
-            cfg.country
-                .clone()
-                .or_else(|| cfg.bing.as_ref().and_then(|b| b.country.clone()))
-        });
-
-    let apod_crop = config
-        .as_ref()
-        .and_then(|cfg| cfg.apod.as_ref().and_then(|a| a.crop))
-        .unwrap_or(true);
 
     let prune_cache_days = if prune_override {
         args.prune_cache_days
@@ -566,8 +495,6 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
 
     let settings = Settings {
         proto: if ssl { "https".into() } else { "http".into() },
-        country,
-        day: 0,
         picture_dir: picture_dir
             .unwrap_or_else(default_picture_dir)
             .expand_tilde(),
@@ -578,18 +505,7 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
         quiet,
         experimental,
         filename: args.filename.clone(),
-        bing_host: "www.bing.com".to_string(),
         source,
-        spotlight_index,
-        spotlight_url_override: None,
-        apod_api_key: config
-            .as_ref()
-            .and_then(|c| c.apod.as_ref().and_then(|a| a.api_key.clone()))
-            .or_else(|| load_apod_api_key_from_config())
-            .or_else(|| env::var("NASA_API_KEY").ok())
-            .unwrap_or_else(|| APOD_DEFAULT_KEY.to_string()),
-        apod_url_override: None,
-        apod_crop,
         prune_cache_days,
     };
 
@@ -616,7 +532,7 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
         }
         Some(CommandArg::Choose) => {
             ensure_picture_dir(&settings.picture_dir)?;
-            return run_choose(&client, &cache, &registry, &settings, resolutions);
+            return run_choose(&client, &cache, &registry, &settings, &source_settings);
         }
         Some(CommandArg::Reapply) => {
             ensure_picture_dir(&settings.picture_dir)?;
@@ -628,13 +544,13 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
     ensure_picture_dir(&settings.picture_dir)?;
 
     let source = require_source(&registry, settings.source)?;
-    let date_label = date_label_for(Some(source), &settings);
+    let date_label = date_label_for(Some(source), &settings, &source_settings);
     let ctx = SourceContext {
         client: &client,
         cache: &cache,
         settings: &settings,
         date_label: &date_label,
-        resolutions: &resolutions,
+        source_settings: &source_settings,
     };
     let result = run_source(source, &ctx);
 
@@ -758,10 +674,14 @@ fn target_date_for_day(day: i32) -> NaiveDate {
     today.checked_sub_signed(delta).unwrap_or(today)
 }
 
-fn date_label_for(source: Option<&dyn Source>, settings: &Settings) -> String {
+fn date_label_for(
+    source: Option<&dyn Source>,
+    _settings: &Settings,
+    source_settings: &SourceSettings,
+) -> String {
     let use_day = source.map(|s| s.supports_day()).unwrap_or(true);
     let target_date = if use_day {
-        target_date_for_day(settings.day)
+        target_date_for_day(source_settings.bing.day)
     } else {
         Local::now().date_naive()
     };
@@ -771,7 +691,7 @@ fn date_label_for(source: Option<&dyn Source>, settings: &Settings) -> String {
 fn run_source(source: &dyn Source, ctx: &SourceContext<'_>) -> Result<()> {
     let fetch_result = source.fetch(ctx)?;
     let candidate = source
-        .pick_default(&fetch_result.candidates, ctx.settings)?
+        .pick_default(&fetch_result.candidates, ctx)?
         .clone();
 
     if ctx.settings.experimental && fetch_result.skipped_download {
@@ -803,15 +723,14 @@ fn run_choose(
     cache: &CacheManager,
     registry: &SourceRegistry,
     settings: &Settings,
-    resolutions: Vec<String>,
+    source_settings: &SourceSettings,
 ) -> Result<()> {
     let mut current_settings = settings.clone();
-    let current_res = resolutions;
     let mut selected_idx: Option<usize> = None;
 
     loop {
         let candidates =
-            gather_candidates(client, cache, registry, &current_settings, &current_res)?;
+            gather_candidates(client, cache, registry, &current_settings, source_settings)?;
         // Force should be one-shot in the chooser to avoid repeated re-downloads.
         current_settings.force = false;
         if candidates.is_empty() {
@@ -929,18 +848,18 @@ fn gather_candidates(
     cache: &CacheManager,
     registry: &SourceRegistry,
     settings: &Settings,
-    resolutions: &[String],
+    source_settings: &SourceSettings,
 ) -> Result<Vec<WallpaperCandidate>> {
     let mut result = Vec::new();
 
     for source in registry.all() {
-        let date_label = date_label_for(Some(source), settings);
+        let date_label = date_label_for(Some(source), settings, source_settings);
         let ctx = SourceContext {
             client,
             cache,
             settings,
             date_label: &date_label,
-            resolutions,
+            source_settings,
         };
         match source.fetch(&ctx) {
             Ok(fetched) => result.extend(fetched.candidates),
@@ -1404,24 +1323,6 @@ pub(crate) fn ensure_http_success(status: StatusCode, url: &str) -> Result<()> {
     Ok(())
 }
 
-fn load_apod_api_key_from_config() -> Option<String> {
-    load_config().and_then(|cfg| {
-        cfg.apod
-            .as_ref()
-            .and_then(|a| a.api_key.clone())
-            .or_else(|| {
-                // Backward compatibility for top-level key.
-                let path = home_dir().join(".wallpaperconfig");
-                let contents = fs::read_to_string(path).ok()?;
-                let parsed: toml::Value = toml::from_str(&contents).ok()?;
-                parsed
-                    .get("apod_api_key")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-            })
-    })
-}
-
 fn load_config() -> Option<AppConfig> {
     let path = home_dir().join(".wallpaperconfig");
     let contents = fs::read_to_string(path).ok()?;
@@ -1462,8 +1363,6 @@ mod tests {
     fn make_settings(tmpdir: &Path, filename: Option<&str>, force: bool) -> Settings {
         Settings {
             proto: "https".into(),
-            country: None,
-            day: 0,
             picture_dir: tmpdir.to_path_buf(),
             auto_update_name: "default".into(),
             monitor: 0,
@@ -1472,13 +1371,7 @@ mod tests {
             quiet: true,
             experimental: false,
             filename: filename.map(ToString::to_string),
-            bing_host: "www.bing.com".into(),
             source: WallpaperSource::Bing,
-            spotlight_index: 1,
-            spotlight_url_override: None,
-            apod_api_key: "TEST".into(),
-            apod_url_override: None,
-            apod_crop: true,
             prune_cache_days: None,
         }
     }
@@ -1489,7 +1382,7 @@ mod tests {
         cache: &CacheManager,
         settings: &Settings,
         date_label: &str,
-        resolutions: &[String],
+        source_settings: &SourceSettings,
     ) -> Result<()> {
         let registry = SourceRegistry::new();
         let source = require_source(&registry, source_id)?;
@@ -1498,7 +1391,7 @@ mod tests {
             cache,
             settings,
             date_label,
-            resolutions,
+            source_settings,
         };
         run_source(source, &ctx)
     }
@@ -1534,9 +1427,10 @@ mod tests {
         let tmpdir = tempdir().unwrap();
         let settings = Settings {
             proto: "http".into(),
-            bing_host: server.address().to_string(),
             ..make_settings(tmpdir.path(), None, false)
         };
+        let mut source_settings = SourceSettings::from_config(None).unwrap();
+        source_settings.bing.host = server.address().to_string();
 
         let target = tmpdir.path().join(format!(
             "default-{}_{}.jpg",
@@ -1551,7 +1445,9 @@ mod tests {
             then.status(200).body("image-bytes");
         });
 
-        let downloaded = bing::download_image(&client, url_base, res, &settings, metadata).unwrap();
+        let downloaded =
+            bing::download_image(&client, url_base, res, &source_settings.bing, &settings, metadata)
+                .unwrap();
         assert!(downloaded.skipped);
         assert_eq!(downloaded.path, target);
         assert_eq!(_mock.hits(), 0);
@@ -1567,9 +1463,10 @@ mod tests {
         let tmpdir = tempdir().unwrap();
         let settings = Settings {
             proto: "http".into(),
-            bing_host: server.address().to_string(),
             ..make_settings(tmpdir.path(), None, false)
         };
+        let mut source_settings = SourceSettings::from_config(None).unwrap();
+        source_settings.bing.host = server.address().to_string();
 
         let old_wallpaper = tmpdir.path().join("default-old.jpg");
         fs::write(&old_wallpaper, b"old").unwrap();
@@ -1580,7 +1477,9 @@ mod tests {
             then.status(200).body("image-bytes");
         });
 
-        let downloaded = bing::download_image(&client, url_base, res, &settings, metadata).unwrap();
+        let downloaded =
+            bing::download_image(&client, url_base, res, &source_settings.bing, &settings, metadata)
+                .unwrap();
         assert!(!downloaded.skipped);
         assert!(downloaded.path.exists());
         assert_eq!(fs::read(&downloaded.path).unwrap(), b"image-bytes");
@@ -1599,9 +1498,10 @@ mod tests {
         let tmpdir = tempdir().unwrap();
         let settings = Settings {
             proto: "http".into(),
-            bing_host: server.address().to_string(),
             ..make_settings(tmpdir.path(), None, false)
         };
+        let mut source_settings = SourceSettings::from_config(None).unwrap();
+        source_settings.bing.host = server.address().to_string();
 
         let target = tmpdir.path().join(format!(
             "default-{}_{}.jpg",
@@ -1615,7 +1515,15 @@ mod tests {
             then.status(404);
         });
 
-        let err = bing::download_image(&client, url_base, res, &settings, metadata).unwrap_err();
+        let err = bing::download_image(
+            &client,
+            url_base,
+            res,
+            &source_settings.bing,
+            &settings,
+            metadata,
+        )
+        .unwrap_err();
         assert!(matches!(err, WallpaperError::DownloadStatus { .. }));
         assert!(!target.exists());
 
@@ -1679,8 +1587,9 @@ mod tests {
         let tmpdir = tempdir().unwrap();
         let mut settings = make_settings(tmpdir.path(), None, false);
         settings.source = WallpaperSource::Spotlight;
-        settings.spotlight_index = 2;
-        settings.spotlight_url_override = Some(api_url.clone());
+        let mut source_settings = SourceSettings::from_config(None).unwrap();
+        source_settings.spotlight.index = 2;
+        source_settings.spotlight.url_override = Some(api_url.clone());
 
         let cache = CacheManager::new(tmpdir.path());
         let client = build_client().unwrap();
@@ -1692,7 +1601,7 @@ mod tests {
             &cache,
             &settings,
             &date_label,
-            &[],
+            &source_settings,
         )
         .unwrap();
         assert_eq!(api_mock.hits(), 1);
@@ -1707,7 +1616,7 @@ mod tests {
             &cache,
             &settings,
             &date_label,
-            &[],
+            &source_settings,
         )
         .unwrap();
         assert_eq!(api_mock.hits(), 1);
@@ -1745,9 +1654,10 @@ mod tests {
         let tmpdir = tempdir().unwrap();
         let mut settings = make_settings(tmpdir.path(), None, false);
         settings.source = WallpaperSource::Apod;
-        settings.apod_api_key = "TEST".into();
-        settings.apod_url_override = Some(api_url);
-        settings.apod_crop = false;
+        let mut source_settings = SourceSettings::from_config(None).unwrap();
+        source_settings.apod.api_key = "TEST".into();
+        source_settings.apod.url_override = Some(api_url);
+        source_settings.apod.crop = false;
 
         let cache = CacheManager::new(tmpdir.path());
         let client = build_client().unwrap();
@@ -1759,7 +1669,7 @@ mod tests {
             &cache,
             &settings,
             date_label,
-            &[],
+            &source_settings,
         )
         .unwrap();
         assert_eq!(api_mock.hits(), 1);
@@ -1772,7 +1682,7 @@ mod tests {
             &cache,
             &settings,
             date_label,
-            &[],
+            &source_settings,
         )
         .unwrap();
         assert_eq!(api_mock.hits(), 1);
@@ -1800,9 +1710,10 @@ mod tests {
         let tmpdir = tempdir().unwrap();
         let mut settings = make_settings(tmpdir.path(), None, false);
         settings.source = WallpaperSource::Apod;
-        settings.apod_api_key = "TEST".into();
-        settings.apod_url_override = Some(api_url);
-        settings.apod_crop = false;
+        let mut source_settings = SourceSettings::from_config(None).unwrap();
+        source_settings.apod.api_key = "TEST".into();
+        source_settings.apod.url_override = Some(api_url);
+        source_settings.apod.crop = false;
 
         let cache = CacheManager::new(tmpdir.path());
         let client = build_client().unwrap();
@@ -1814,7 +1725,7 @@ mod tests {
             &cache,
             &settings,
             date_label,
-            &[],
+            &source_settings,
         )
         .unwrap_err();
         let msg = format!("{err}");

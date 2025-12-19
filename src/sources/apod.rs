@@ -10,11 +10,55 @@ use serde::Deserialize;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::env;
 
 use super::{FetchResult, Source, SourceContext};
 
 pub const APOD_URL: &str = "https://api.nasa.gov/planetary/apod";
 pub const APOD_DEFAULT_KEY: &str = "DEMO_KEY";
+
+#[derive(Debug, Clone)]
+pub struct ApodSettings {
+    pub api_key: String,
+    pub crop: bool,
+    pub url_override: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, Clone)]
+pub struct ApodConfig {
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub crop: Option<bool>,
+    #[serde(default)]
+    pub url_override: Option<String>,
+}
+
+impl ApodSettings {
+    pub fn from_config(config: Option<&crate::AppConfig>) -> Self {
+        let (api_key, crop, url_override, top_level_key) = if let Some(cfg) = config {
+            (
+                cfg.apod.as_ref().and_then(|a| a.api_key.clone()),
+                cfg.apod.as_ref().and_then(|a| a.crop),
+                cfg.apod.as_ref().and_then(|a| a.url_override.clone()),
+                cfg.apod_api_key.clone(),
+            )
+        } else {
+            (None, None, None, None)
+        };
+
+        let key = api_key
+            .or(top_level_key)
+            .or_else(|| env::var("NASA_API_KEY").ok())
+            .unwrap_or_else(|| APOD_DEFAULT_KEY.to_string());
+
+        Self {
+            api_key: key,
+            crop: crop.unwrap_or(true),
+            url_override,
+        }
+    }
+}
 
 pub struct ApodSource;
 
@@ -32,14 +76,20 @@ impl Source for ApodSource {
     }
 
     fn fetch(&self, ctx: &SourceContext<'_>) -> Result<FetchResult> {
-        let candidate = fetch_apod_candidate(ctx.client, ctx.cache, ctx.settings, ctx.date_label)?;
+        let candidate = fetch_apod_candidate(
+            ctx.client,
+            ctx.cache,
+            ctx.settings,
+            ctx.date_label,
+            &ctx.source_settings.apod,
+        )?;
         Ok(FetchResult::single(candidate, false))
     }
 
     fn pick_default<'a>(
         &self,
         candidates: &'a [WallpaperCandidate],
-        _settings: &Settings,
+        _ctx: &SourceContext<'_>,
     ) -> Result<&'a WallpaperCandidate> {
         candidates
             .first()
@@ -68,6 +118,7 @@ pub(crate) fn fetch_apod_candidate(
     cache: &CacheManager,
     settings: &Settings,
     date_label: &str,
+    apod_settings: &ApodSettings,
 ) -> Result<WallpaperCandidate> {
     let candidate_id = format!("apod-{date_label}");
     if !settings.force {
@@ -82,7 +133,7 @@ pub(crate) fn fetch_apod_candidate(
         }
     }
 
-    let apod = fetch_apod(client, settings, date_label)?;
+    let apod = fetch_apod(client, settings, apod_settings, date_label)?;
     if apod.media_type != "image" {
         return Err(WallpaperError::Message(
             "APOD media type is not an image; skipping.".to_string(),
@@ -118,7 +169,7 @@ pub(crate) fn fetch_apod_candidate(
         &format!("APOD image URL: {}", candidate.image_url),
         settings,
     );
-    if settings.apod_crop {
+    if apod_settings.crop {
         let spinner = start_spinner(settings, "Processing APOD image…");
         match crop_and_resize_apod(&candidate.local_path) {
             Ok(()) => finish_spinner(spinner, "Processed APOD image", settings, false),
@@ -138,11 +189,16 @@ pub(crate) fn fetch_apod_candidate(
     Ok(candidate)
 }
 
-fn fetch_apod(client: &Client, settings: &Settings, date_label: &str) -> Result<ApodResponse> {
+fn fetch_apod(
+    client: &Client,
+    settings: &Settings,
+    apod_settings: &ApodSettings,
+    date_label: &str,
+) -> Result<ApodResponse> {
     let mut serializer = url::form_urlencoded::Serializer::new(String::new());
-    serializer.append_pair("api_key", &settings.apod_api_key);
+    serializer.append_pair("api_key", &apod_settings.api_key);
     serializer.append_pair("date", date_label);
-    let base = settings.apod_url_override.as_deref().unwrap_or(APOD_URL);
+    let base = apod_settings.url_override.as_deref().unwrap_or(APOD_URL);
     let url = format!("{base}?{}", serializer.finish());
     log_verbose(&format!("Fetching APOD metadata: {}", url), settings);
     let response = client.get(&url).timeout(METADATA_TIMEOUT).send()?;

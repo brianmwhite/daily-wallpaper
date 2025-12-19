@@ -10,7 +10,7 @@ pub struct SourceContext<'a> {
     pub cache: &'a CacheManager,
     pub settings: &'a Settings,
     pub date_label: &'a str,
-    pub resolutions: &'a [String],
+    pub source_settings: &'a SourceSettings,
 }
 
 #[derive(Debug)]
@@ -41,7 +41,7 @@ pub trait Source: Send + Sync {
     fn pick_default<'a>(
         &self,
         candidates: &'a [WallpaperCandidate],
-        _settings: &Settings,
+        _ctx: &SourceContext<'_>,
     ) -> Result<&'a WallpaperCandidate> {
         candidates
             .first()
@@ -79,5 +79,22 @@ impl SourceRegistry {
 
     pub fn all(&self) -> impl Iterator<Item = &dyn Source> {
         self.sources.iter().map(|boxed| boxed.as_ref())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SourceSettings {
+    pub bing: bing::BingSettings,
+    pub spotlight: spotlight::SpotlightSettings,
+    pub apod: apod::ApodSettings,
+}
+
+impl SourceSettings {
+    pub fn from_config(config: Option<&crate::AppConfig>) -> crate::Result<Self> {
+        Ok(Self {
+            bing: bing::BingSettings::from_config(config),
+            spotlight: spotlight::SpotlightSettings::from_config(config)?,
+            apod: apod::ApodSettings::from_config(config),
+        })
     }
 }

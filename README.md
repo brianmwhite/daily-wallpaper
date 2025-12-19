@@ -134,9 +134,9 @@ crop = true
 The pipeline is already generic: sources implement `Source`, return `WallpaperCandidate`s, and are registered in `SourceRegistry`. To add a new source with minimal `src/lib.rs` churn:
 
 1) Create `src/sources/<name>.rs` implementing `Source` (follow `apod.rs`/`spotlight.rs`). Reuse helpers: `download_to_path`, `ensure_http_success`, `CacheManager::media_dir`, `SourceContext`.
-2) Register it in `SourceRegistry::new()` in `src/sources/mod.rs`.
-3) Add a `WallpaperSource` variant and wire the CLI: update `source_dir_name`, `SourceArg` + `map_source` so the CLI can select it.
-4) If it needs config, extend `AppConfig` in `src/lib.rs` and pull defaults the same way Bing/APOD/Spotlight do; keep overrides via CLI/env.
+2) Add a per-source settings struct + config struct in that module and wire it into `SourceSettings` in `src/sources/mod.rs` (so `SourceContext` carries your settings). Keep any validation inside the source module.
+3) Register the source in `SourceRegistry::new()` in `src/sources/mod.rs`, and add a `WallpaperSource` + `SourceArg` mapping in `src/lib.rs` so it can be selected.
+4) If the source needs config, extend `AppConfig` with an optional section (e.g., `[yoursource]`) and have your module’s `Settings::from_config` pull defaults (env/legacy keys as needed).
 5) Add tests (e.g., with `httpmock`) so the new source doesn’t hit real networks.
 
 All chooser/apply/cache logic is source-agnostic; new sources should not require further changes to `src/lib.rs` beyond registration and optional config wiring.

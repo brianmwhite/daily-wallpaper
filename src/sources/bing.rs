@@ -4,6 +4,7 @@ use crate::{
     WallpaperSource, DEFAULT_RESOLUTIONS, IMAGE_TIMEOUT, METADATA_TIMEOUT,
 };
 use reqwest::blocking::Client;
+use serde::Deserialize;
 use roxmltree;
 use std::ffi::OsStr;
 use std::fs::{self, File};
@@ -11,6 +12,49 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use super::{FetchResult, Source, SourceContext};
+
+#[derive(Debug, Clone)]
+pub struct BingSettings {
+    pub host: String,
+    pub country: Option<String>,
+    pub resolutions: Vec<String>,
+    pub day: i32,
+}
+
+#[derive(Debug, Default, Deserialize, Clone)]
+pub struct BingConfig {
+    #[serde(default)]
+    pub country: Option<String>,
+    #[serde(default)]
+    pub resolutions: Option<Vec<String>>,
+}
+
+impl BingSettings {
+    pub fn from_config(config: Option<&crate::AppConfig>) -> Self {
+        let country = config
+            .and_then(|cfg| {
+                cfg.country
+                    .clone()
+                    .or_else(|| cfg.bing.as_ref().and_then(|b| b.country.clone()))
+            });
+
+        let resolutions = config
+            .and_then(|cfg| {
+                cfg.bing
+                    .as_ref()
+                    .and_then(|b| b.resolutions.clone())
+                    .or_else(|| cfg.resolutions.clone())
+            })
+            .unwrap_or_else(|| DEFAULT_RESOLUTIONS.iter().map(|s| s.to_string()).collect());
+
+        Self {
+            host: "www.bing.com".to_string(),
+            country,
+            resolutions,
+            day: 0,
+        }
+    }
+}
 
 pub struct BingSource;
 
@@ -28,10 +72,10 @@ impl Source for BingSource {
     }
 
     fn fetch(&self, ctx: &SourceContext<'_>) -> Result<FetchResult> {
-        let resolutions: Vec<String> = if ctx.resolutions.is_empty() {
+        let resolutions = if ctx.source_settings.bing.resolutions.is_empty() {
             DEFAULT_RESOLUTIONS.iter().map(|s| s.to_string()).collect()
         } else {
-            ctx.resolutions.to_vec()
+            ctx.source_settings.bing.resolutions.clone()
         };
 
         let fetched = fetch_bing_candidate(
@@ -39,6 +83,7 @@ impl Source for BingSource {
             ctx.cache,
             ctx.settings,
             ctx.date_label,
+            &ctx.source_settings.bing,
             resolutions,
         )?;
         Ok(FetchResult::single(
@@ -50,7 +95,7 @@ impl Source for BingSource {
     fn pick_default<'a>(
         &self,
         candidates: &'a [WallpaperCandidate],
-        _settings: &Settings,
+        _ctx: &SourceContext<'_>,
     ) -> Result<&'a WallpaperCandidate> {
         candidates
             .first()
@@ -70,6 +115,7 @@ pub(crate) fn fetch_bing_candidate(
     cache: &CacheManager,
     settings: &Settings,
     date_label: &str,
+    bing_settings: &BingSettings,
     resolutions: Vec<String>,
 ) -> Result<FetchedCandidate> {
     if !settings.force {
@@ -91,7 +137,7 @@ pub(crate) fn fetch_bing_candidate(
         }
     }
 
-    let archive_url = build_archive_url(settings.day, settings.country.as_deref());
+    let archive_url = build_archive_url(bing_settings.day, bing_settings.country.as_deref());
     log_verbose(
         &format!("Fetching Bing metadata: {}", archive_url),
         settings,
@@ -101,7 +147,14 @@ pub(crate) fn fetch_bing_candidate(
 
     let mut last_error: Option<WallpaperError> = None;
     for res in resolutions {
-        match download_image(client, &url_base, &res, settings, &metadata_body) {
+        match download_image(
+            client,
+            &url_base,
+            &res,
+            bing_settings,
+            settings,
+            &metadata_body,
+        ) {
             Ok(downloaded) => {
                 let candidate = WallpaperCandidate {
                     id: format!("bing-{date_label}-{res}"),
@@ -230,6 +283,7 @@ pub(crate) fn download_image(
     client: &Client,
     url_base: &str,
     resolution: &str,
+    bing_settings: &BingSettings,
     settings: &Settings,
     metadata_body: &[u8],
 ) -> Result<DownloadedImage> {
@@ -237,7 +291,7 @@ pub(crate) fn download_image(
     let file_url = format!(
         "{}://{}/{}",
         settings.proto,
-        settings.bing_host,
+        bing_settings.host,
         file_url_with_res.trim_start_matches('/')
     );
     log_verbose(
