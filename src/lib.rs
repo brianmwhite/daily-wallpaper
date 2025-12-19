@@ -832,7 +832,7 @@ fn run_choose(
             })
             .collect();
         labels.push(format!(
-            "{}: Favorites ({})",
+            "{}: [Favorites] ({})",
             candidates.len() + 1,
             favorite_entries.len()
         ));
