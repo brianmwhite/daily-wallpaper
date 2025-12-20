@@ -120,18 +120,53 @@ pub(crate) fn fetch_bing_candidate(
 ) -> Result<FetchedCandidate> {
     if let Some(candidate) = cache.find_candidate(date_label, WallpaperSource::Bing)? {
         if candidate.local_path.exists() && (!settings.force || settings.offline) {
-            log_verbose(
-                &format!(
-                    "Using cached wallpaper for {} from {:?}",
-                    date_label, candidate.source
-                ),
-                settings,
-            );
-            ensure_info_file(&settings.picture_dir, &candidate)?;
-            return Ok(FetchedCandidate {
-                candidate,
-                skipped_download: true,
+            if settings.offline {
+                log_verbose(
+                    &format!(
+                        "Using cached wallpaper for {} from {:?}",
+                        date_label, candidate.source
+                    ),
+                    settings,
+                );
+                ensure_info_file(&settings.picture_dir, &candidate)?;
+                return Ok(FetchedCandidate {
+                    candidate,
+                    skipped_download: true,
+                });
+            }
+
+            let cached_date = candidate.metadata_xml.as_deref().and_then(|xml| {
+                metadata_date_label(xml.as_bytes())
+                    .ok()
+                    .and_then(|date| date)
             });
+            if let Some(cached_date) = cached_date {
+                if cached_date == date_label {
+                    log_verbose(
+                        &format!(
+                            "Using cached wallpaper for {} from {:?}",
+                            date_label, candidate.source
+                        ),
+                        settings,
+                    );
+                    ensure_info_file(&settings.picture_dir, &candidate)?;
+                    return Ok(FetchedCandidate {
+                        candidate,
+                        skipped_download: true,
+                    });
+                }
+                log_verbose(
+                    &format!(
+                        "Cached Bing metadata date {cached_date} does not match {date_label}; checking for update."
+                    ),
+                    settings,
+                );
+            } else {
+                log_verbose(
+                    "Cached Bing metadata missing startdate; checking for update.",
+                    settings,
+                );
+            }
         }
     }
 
@@ -255,6 +290,24 @@ fn parse_xml_text(body: &[u8], tag: &str) -> Result<Option<String>> {
         .descendants()
         .find(|node| node.has_tag_name(tag))
         .and_then(|node| node.text().map(|t| t.to_string())))
+}
+
+fn normalize_startdate(startdate: &str) -> Option<String> {
+    let trimmed = startdate.trim();
+    if trimmed.len() != 8 || !trimmed.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    Some(format!(
+        "{}-{}-{}",
+        &trimmed[0..4],
+        &trimmed[4..6],
+        &trimmed[6..8]
+    ))
+}
+
+fn metadata_date_label(body: &[u8]) -> Result<Option<String>> {
+    let startdate = parse_xml_text(body, "startdate")?;
+    Ok(startdate.and_then(|raw| normalize_startdate(&raw)))
 }
 
 pub(crate) fn sanitize_filename(name: &str) -> String {
