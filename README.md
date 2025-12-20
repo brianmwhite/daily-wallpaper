@@ -121,6 +121,12 @@ offline = false
 # Spotlight settings
 spotlight_index = 1
 
+# Wrap width for info output (used by `info` and the chooser)
+info_wrap_width = 80
+
+# Render info output without colors or emojis
+info_plain_text = false
+
 [bing]
 country = "en-US"
 resolutions = ["1920x1200", "1920x1080", "1366x768", "UHD"]

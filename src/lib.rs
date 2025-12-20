@@ -41,6 +41,13 @@ const PLIST_BASENAME: &str = "com.thirdember.daily-wallpaper";
 const CACHE_DIR_NAME: &str = "cache";
 const CACHE_INDEX_FILE: &str = "index.json";
 const LAST_APPLIED_FILE: &str = "last_applied.json";
+const DEFAULT_INFO_WRAP_WIDTH: usize = 80;
+const INFO_LABEL_COLOR: &str = "\u{1b}[1;36m";
+const INFO_RESET: &str = "\u{1b}[0m";
+const INFO_ICON_TITLE: &str = "\u{1f5bc}\u{fe0f}";
+const INFO_ICON_ABOUT: &str = "\u{1f4dd}";
+const INFO_ICON_CREDIT: &str = "\u{270d}\u{fe0f}";
+const INFO_ICON_LINK: &str = "\u{1f517}";
 
 fn source_dir_name(source: WallpaperSource) -> &'static str {
     match source {
@@ -103,6 +110,8 @@ struct Settings {
     filename: Option<String>,
     source: WallpaperSource,
     prune_cache_days: Option<u32>,
+    info_wrap_width: usize,
+    info_plain_text: bool,
 }
 
 impl Settings {
@@ -182,6 +191,10 @@ struct AppConfig {
     offline: Option<bool>,
     #[serde(default)]
     spotlight_index: Option<usize>,
+    #[serde(default)]
+    info_wrap_width: Option<usize>,
+    #[serde(default)]
+    info_plain_text: Option<bool>,
     #[serde(default)]
     apod_api_key: Option<String>,
     #[serde(default)]
@@ -519,6 +532,16 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
         args.all_desktops_experimental
     };
 
+    let info_wrap_width = config
+        .as_ref()
+        .and_then(|cfg| cfg.info_wrap_width)
+        .unwrap_or(DEFAULT_INFO_WRAP_WIDTH)
+        .max(20);
+    let info_plain_text = config
+        .as_ref()
+        .and_then(|cfg| cfg.info_plain_text)
+        .unwrap_or(false);
+
     let resolved_picture_dir = picture_dir
         .unwrap_or_else(default_picture_dir)
         .expand_tilde();
@@ -540,6 +563,8 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
         filename: args.filename.clone(),
         source,
         prune_cache_days,
+        info_wrap_width,
+        info_plain_text,
     };
 
     if settings.offline && settings.force {
@@ -568,7 +593,7 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
         Some(CommandArg::Info) => {
             let stdout = io::stdout();
             let mut handle = stdout.lock();
-            show_info(&cache, &mut handle)?;
+            show_info(&cache, &settings, &mut handle)?;
             return Ok(());
         }
         Some(CommandArg::Choose) => {
@@ -912,7 +937,7 @@ fn run_choose(
                     }
                     Ok(choice) if choice.starts_with("Info") => {
                         println!();
-                    println!("{}", format_candidate_info(cand));
+                    println!("{}", format_candidate_info(cand, settings));
                     println!();
                     wait_for_enter("Press Enter or Esc to return...");
                     continue;
@@ -1042,7 +1067,7 @@ fn run_favorites_menu(
                 }
                 Ok(choice) if choice.starts_with("Info") => {
                     println!();
-                    println!("{}", format_favorite_info(fav));
+                    println!("{}", format_favorite_info(fav, settings));
                     println!();
                     wait_for_enter("Press Enter or Esc to return...");
                     continue;
@@ -1470,54 +1495,124 @@ fn remove_launchd_plist(settings: &Settings) -> Result<()> {
     Ok(())
 }
 
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        if line.is_empty() {
+            line.push_str(word);
+            continue;
+        }
+        if line.len() + 1 + word.len() > width {
+            lines.push(line);
+            line = word.to_string();
+        } else {
+            line.push(' ');
+            line.push_str(word);
+        }
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+fn format_info_line(
+    icon: &str,
+    label: &str,
+    value: &str,
+    width: usize,
+    plain: bool,
+) -> Vec<String> {
+    let clean_value = value.replace(['\n', '\r'], " ");
+    let prefix_plain = if icon.is_empty() {
+        format!("{label}: ")
+    } else {
+        format!("{icon} {label}: ")
+    };
+    let prefix_styled = if plain {
+        prefix_plain.clone()
+    } else if icon.is_empty() {
+        format!("{INFO_LABEL_COLOR}{label}:{INFO_RESET} ")
+    } else {
+        format!("{INFO_LABEL_COLOR}{icon} {label}:{INFO_RESET} ")
+    };
+    let prefix_len = prefix_plain.chars().count();
+    if width <= prefix_len + 8 {
+        return vec![format!("{prefix_styled}{clean_value}")];
+    }
+
+    let content_width = width.saturating_sub(prefix_len).max(8);
+    let wrapped = wrap_text(&clean_value, content_width);
+    let indent = " ".repeat(prefix_len);
+    wrapped
+        .into_iter()
+        .enumerate()
+        .map(|(idx, line)| {
+            if idx == 0 {
+                format!("{prefix_styled}{line}")
+            } else {
+                format!("{indent}{line}")
+            }
+        })
+        .collect()
+}
+
 fn format_basic_info(
     title: Option<&str>,
     description: Option<&str>,
     attribution: Option<&str>,
     info_url: Option<&str>,
+    width: usize,
+    plain: bool,
 ) -> String {
-    let mut info = String::new();
+    let mut lines: Vec<String> = Vec::new();
+    let title_icon = if plain { "" } else { INFO_ICON_TITLE };
+    let about_icon = if plain { "" } else { INFO_ICON_ABOUT };
+    let credit_icon = if plain { "" } else { INFO_ICON_CREDIT };
+    let link_icon = if plain { "" } else { INFO_ICON_LINK };
     if let Some(title) = title.filter(|t| !t.is_empty()) {
-        info.push_str(title);
-        info.push('\n');
+        lines.extend(format_info_line(title_icon, "Title", title, width, plain));
     }
     if let Some(desc) = description.filter(|d| !d.is_empty()) {
-        info.push_str(desc);
-        info.push('\n');
+        lines.extend(format_info_line(about_icon, "About", desc, width, plain));
     }
     let attribution = attribution
         .filter(|a| !a.is_empty())
         .unwrap_or("Unknown copyright");
-    info.push_str(attribution);
+    lines.extend(format_info_line(credit_icon, "Credit", attribution, width, plain));
     if let Some(link) = info_url.filter(|l| !l.is_empty()) {
-        info.push('\n');
-        info.push_str(link);
+        lines.extend(format_info_line(link_icon, "Link", link, width, plain));
     }
-    info
+    lines.join("\n")
 }
 
-fn format_candidate_info(candidate: &WallpaperCandidate) -> String {
+fn format_candidate_info(candidate: &WallpaperCandidate, settings: &Settings) -> String {
     format_basic_info(
         candidate.title.as_deref(),
         candidate.description.as_deref(),
         candidate.attribution.as_deref(),
         candidate.info_url.as_deref(),
+        settings.info_wrap_width,
+        settings.info_plain_text,
     )
 }
 
-fn format_favorite_info(favorite: &FavoriteEntry) -> String {
+fn format_favorite_info(favorite: &FavoriteEntry, settings: &Settings) -> String {
     format_basic_info(
         favorite.title.as_deref(),
         favorite.description.as_deref(),
         favorite.attribution.as_deref(),
         favorite.info_url.as_deref(),
+        settings.info_wrap_width,
+        settings.info_plain_text,
     )
 }
 
-fn show_info<W: Write>(
-    cache: &CacheManager,
-    mut writer: W,
-) -> Result<()> {
+fn show_info<W: Write>(cache: &CacheManager, settings: &Settings, mut writer: W) -> Result<()> {
     let Some(last) = cache.read_last_applied()? else {
         return Err(WallpaperError::Message(
             "No previously applied wallpaper found. Run the download first.".to_string(),
@@ -1534,7 +1629,7 @@ fn show_info<W: Write>(
     };
 
     if let Some(candidate) = candidate {
-        let info = format_candidate_info(&candidate);
+        let info = format_candidate_info(&candidate, settings);
         writeln!(writer, "{info}")?;
         return Ok(());
     }
@@ -1614,19 +1709,21 @@ mod tests {
 
     fn make_settings(tmpdir: &Path, filename: Option<&str>, force: bool) -> Settings {
         Settings {
-        proto: "https".into(),
-        picture_dir: tmpdir.to_path_buf(),
-        favorites_dir: tmpdir.join("favorites"),
-        auto_update_name: "default".into(),
-        monitor: 0,
-        force,
-        offline: false,
-        verbose: false,
-        quiet: true,
-        experimental: false,
+            proto: "https".into(),
+            picture_dir: tmpdir.to_path_buf(),
+            favorites_dir: tmpdir.join("favorites"),
+            auto_update_name: "default".into(),
+            monitor: 0,
+            force,
+            offline: false,
+            verbose: false,
+            quiet: true,
+            experimental: false,
             filename: filename.map(ToString::to_string),
             source: WallpaperSource::Bing,
             prune_cache_days: None,
+            info_wrap_width: DEFAULT_INFO_WRAP_WIDTH,
+            info_plain_text: false,
         }
     }
 
@@ -2192,7 +2289,8 @@ mod tests {
             .unwrap();
 
         let mut buffer = Vec::new();
-        show_info(&cache, &mut buffer).unwrap();
+        let settings = make_settings(tmpdir.path(), None, false);
+        show_info(&cache, &settings, &mut buffer).unwrap();
         let output = String::from_utf8(buffer).unwrap();
         assert!(output.contains("Spotlight Title"));
         assert!(output.contains("Spotlight description"));
@@ -2205,7 +2303,8 @@ mod tests {
         let tmpdir = tempdir().unwrap();
         let cache = CacheManager::new(tmpdir.path());
         let mut buffer = Vec::new();
-        let err = show_info(&cache, &mut buffer).unwrap_err();
+        let settings = make_settings(tmpdir.path(), None, false);
+        let err = show_info(&cache, &settings, &mut buffer).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("previously applied wallpaper"));
     }
