@@ -1,6 +1,6 @@
 use chrono::{Duration as ChronoDuration, Local, NaiveDate};
 use clap::{ArgAction, Parser, ValueEnum};
-use inquire::{InquireError, Select};
+use inquire::{InquireError, Select, Text};
 use plist::{Dictionary, Value};
 use reqwest::blocking::Client;
 use reqwest::StatusCode;
@@ -869,12 +869,13 @@ fn run_choose(
                 let mut actions = vec![
                     "Preview (Quick Look)".to_string(),
                     "Apply".to_string(),
+                    "Info".to_string(),
                     "Favorite".to_string(),
                     "Refresh list (force re-download)".to_string(),
                     "Quit chooser".to_string(),
                 ];
                 if favorite_ids.contains(&cand.id) {
-                    actions[2] = "Favorite (already saved)".to_string();
+                    actions[3] = "Favorite (already saved)".to_string();
                 }
 
                 let action = Select::new("Action", actions)
@@ -909,6 +910,13 @@ fn run_choose(
                             Err(err) => println!("Failed to apply wallpaper: {err}"),
                         }
                     }
+                    Ok(choice) if choice.starts_with("Info") => {
+                        println!();
+                    println!("{}", format_candidate_info(cand));
+                    println!();
+                    wait_for_enter("Press Enter or Esc to return...");
+                    continue;
+                }
                     Ok(choice) if choice.starts_with("Favorite") => {
                         match favorites.save_favorite(cand) {
                             Ok(_) => println!("Saved to favorites."),
@@ -996,6 +1004,7 @@ fn run_favorites_menu(
                 vec![
                     "Preview (Quick Look)",
                     "Apply",
+                    "Info",
                     "Remove from favorites",
                     "Back",
                 ],
@@ -1030,6 +1039,13 @@ fn run_favorites_menu(
                         Ok(()) => return Ok(()),
                         Err(err) => println!("Failed to apply wallpaper: {err}"),
                     }
+                }
+                Ok(choice) if choice.starts_with("Info") => {
+                    println!();
+                    println!("{}", format_favorite_info(fav));
+                    println!();
+                    wait_for_enter("Press Enter or Esc to return...");
+                    continue;
                 }
                 Ok(choice) if choice.starts_with("Remove") => {
                     if let Err(err) = manager.remove(fav) {
@@ -1454,31 +1470,48 @@ fn remove_launchd_plist(settings: &Settings) -> Result<()> {
     Ok(())
 }
 
-fn format_candidate_info(candidate: &WallpaperCandidate) -> String {
+fn format_basic_info(
+    title: Option<&str>,
+    description: Option<&str>,
+    attribution: Option<&str>,
+    info_url: Option<&str>,
+) -> String {
     let mut info = String::new();
-    if let Some(title) = candidate.title.as_deref().filter(|t| !t.is_empty()) {
+    if let Some(title) = title.filter(|t| !t.is_empty()) {
         info.push_str(title);
         info.push('\n');
     }
-    if let Some(desc) = candidate
-        .description
-        .as_deref()
-        .filter(|d| !d.is_empty())
-    {
+    if let Some(desc) = description.filter(|d| !d.is_empty()) {
         info.push_str(desc);
         info.push('\n');
     }
-    let attribution = candidate
-        .attribution
-        .as_deref()
+    let attribution = attribution
         .filter(|a| !a.is_empty())
         .unwrap_or("Unknown copyright");
     info.push_str(attribution);
-    if let Some(link) = candidate.info_url.as_deref().filter(|l| !l.is_empty()) {
+    if let Some(link) = info_url.filter(|l| !l.is_empty()) {
         info.push('\n');
         info.push_str(link);
     }
     info
+}
+
+fn format_candidate_info(candidate: &WallpaperCandidate) -> String {
+    format_basic_info(
+        candidate.title.as_deref(),
+        candidate.description.as_deref(),
+        candidate.attribution.as_deref(),
+        candidate.info_url.as_deref(),
+    )
+}
+
+fn format_favorite_info(favorite: &FavoriteEntry) -> String {
+    format_basic_info(
+        favorite.title.as_deref(),
+        favorite.description.as_deref(),
+        favorite.attribution.as_deref(),
+        favorite.info_url.as_deref(),
+    )
 }
 
 fn show_info<W: Write>(
@@ -1509,6 +1542,15 @@ fn show_info<W: Write>(
     Err(WallpaperError::Message(
         "No metadata found for last applied wallpaper. Run the download first.".to_string(),
     ))
+}
+
+fn wait_for_enter(prompt: &str) {
+    let result = Text::new(prompt).prompt();
+    match result {
+        Ok(_) => {}
+        Err(InquireError::OperationCanceled) | Err(InquireError::OperationInterrupted) => {}
+        Err(_) => {}
+    }
 }
 
 fn ensure_picture_dir(path: &Path) -> Result<()> {
