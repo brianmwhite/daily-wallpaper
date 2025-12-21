@@ -1,5 +1,6 @@
 pub mod apod;
 pub mod bing;
+pub mod modis;
 pub mod spotlight;
 
 use crate::{CacheManager, Result, Settings, WallpaperCandidate, WallpaperSource};
@@ -66,6 +67,7 @@ impl SourceRegistry {
                 Box::new(bing::BingSource),
                 Box::new(spotlight::SpotlightSource),
                 Box::new(apod::ApodSource),
+                Box::new(modis::ModisSource),
             ],
         }
     }
@@ -87,6 +89,7 @@ pub struct SourceSettings {
     pub bing: bing::BingSettings,
     pub spotlight: spotlight::SpotlightSettings,
     pub apod: apod::ApodSettings,
+    pub modis: modis::ModisSettings,
 }
 
 impl SourceSettings {
@@ -95,6 +98,7 @@ impl SourceSettings {
             bing: bing::BingSettings::from_config(config),
             spotlight: spotlight::SpotlightSettings::from_config(config)?,
             apod: apod::ApodSettings::from_config(config),
+            modis: modis::ModisSettings::from_config(config),
         })
     }
 }

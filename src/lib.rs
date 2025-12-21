@@ -54,6 +54,61 @@ fn source_dir_name(source: WallpaperSource) -> &'static str {
         WallpaperSource::Bing => "bing",
         WallpaperSource::Spotlight => "spotlight",
         WallpaperSource::Apod => "apod",
+        WallpaperSource::Modis => "modis",
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+enum WallpaperSource {
+    Bing,
+    Spotlight,
+    Apod,
+    Modis,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+enum ConfigSource {
+    Bing,
+    Spotlight,
+    Apod,
+    Modis,
+}
+
+impl From<ConfigSource> for SourceArg {
+    fn from(value: ConfigSource) -> Self {
+        match value {
+            ConfigSource::Bing => SourceArg::Bing,
+            ConfigSource::Spotlight => SourceArg::Spotlight,
+            ConfigSource::Apod => SourceArg::Apod,
+            ConfigSource::Modis => SourceArg::Modis,
+        }
+    }
+}
+
+#[derive(Debug, Clone, ValueEnum, PartialEq, Eq)]
+enum SourceArg {
+    Bing,
+    Spotlight,
+    Apod,
+    Modis,
+}
+
+fn map_source(source: SourceArg) -> WallpaperSource {
+    match source {
+        SourceArg::Bing => WallpaperSource::Bing,
+        SourceArg::Spotlight => WallpaperSource::Spotlight,
+        SourceArg::Apod => WallpaperSource::Apod,
+        SourceArg::Modis => WallpaperSource::Modis,
+    }
+}
+
+fn source_label(source: WallpaperSource) -> &'static str {
+    match source {
+        WallpaperSource::Bing => "Bing",
+        WallpaperSource::Spotlight => "Spotlight",
+        WallpaperSource::Apod => "APOD",
+        WallpaperSource::Modis => "MODIS",
     }
 }
 
@@ -124,31 +179,6 @@ impl Settings {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-enum WallpaperSource {
-    Bing,
-    Spotlight,
-    Apod,
-}
-
-#[derive(Debug, Deserialize, Clone, Copy)]
-#[serde(rename_all = "lowercase")]
-enum ConfigSource {
-    Bing,
-    Spotlight,
-    Apod,
-}
-
-impl From<ConfigSource> for SourceArg {
-    fn from(value: ConfigSource) -> Self {
-        match value {
-            ConfigSource::Bing => SourceArg::Bing,
-            ConfigSource::Spotlight => SourceArg::Spotlight,
-            ConfigSource::Apod => SourceArg::Apod,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WallpaperCandidate {
     id: String,
@@ -203,6 +233,8 @@ struct AppConfig {
     resolutions: Option<Vec<String>>,
     #[serde(default)]
     apod: Option<sources::apod::ApodConfig>,
+    #[serde(default)]
+    modis: Option<sources::modis::ModisConfig>,
     #[serde(default)]
     bing: Option<sources::bing::BingConfig>,
     #[serde(default)]
@@ -358,20 +390,6 @@ enum CommandArg {
     Reapply,
 }
 
-#[derive(Debug, Clone, ValueEnum, PartialEq, Eq)]
-enum SourceArg {
-    Bing,
-    Spotlight,
-    Apod,
-}
-
-fn map_source(source: SourceArg) -> WallpaperSource {
-    match source {
-        SourceArg::Bing => WallpaperSource::Bing,
-        SourceArg::Spotlight => WallpaperSource::Spotlight,
-        SourceArg::Apod => WallpaperSource::Apod,
-    }
-}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -1118,13 +1136,6 @@ fn gather_candidates(
     Ok(result)
 }
 
-fn source_label(source: WallpaperSource) -> &'static str {
-    match source {
-        WallpaperSource::Bing => "Bing",
-        WallpaperSource::Spotlight => "Spotlight",
-        WallpaperSource::Apod => "APOD",
-    }
-}
 
 #[derive(Debug)]
 struct DownloadedFile {
