@@ -83,6 +83,22 @@ daily-wallpaper disable-auto-update --auto-update-name <name>
 
 Tip: install first (`cargo install --path .`) so `launchd` references a stable binary path.
 
+## Display sync (`launchd`)
+
+Create a LaunchAgent that listens for display/monitor changes and reapplies the last wallpaper:
+
+```sh
+daily-wallpaper enable-display-sync [options]
+```
+
+This uses CoreGraphics display-change notifications (event-driven, no polling).
+
+Disable it with:
+
+```sh
+daily-wallpaper disable-display-sync --auto-update-name <name>
+```
+
 ## Show wallpaper info
 
 After a download, display the Bing headline and copyright for the saved wallpaper:
@@ -158,6 +174,8 @@ All chooser/apply/cache logic is source-agnostic; new sources should not require
 ```
   enable-auto-update             Write and load a launchd plist for periodic updates.
   disable-auto-update            Unload and remove the launchd plist.
+  enable-display-sync            Write and load a launchd plist that reapplies wallpaper on display changes.
+  disable-display-sync           Unload and remove the display sync launchd plist.
   info                           Print the headline and copyright of the last download.
   choose                         Interactive picker (arrows/Enter) for Bing + Spotlight (3) + APOD; preview via Quick Look.
                                  Also includes a Favorites list for saved wallpapers.

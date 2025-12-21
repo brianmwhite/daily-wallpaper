@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::collections::HashSet;
+#[cfg(target_os = "macos")]
+use std::os::raw::c_void;
 use thiserror::Error;
 
 mod sources;
@@ -177,6 +179,17 @@ impl Settings {
     fn plist_label(&self) -> String {
         format!("{PLIST_BASENAME}.{}", self.auto_update_name)
     }
+
+    fn display_sync_plist_filename(&self) -> PathBuf {
+        launchd_dir().join(format!(
+            "{PLIST_BASENAME}-display-sync-{}.plist",
+            self.auto_update_name
+        ))
+    }
+
+    fn display_sync_label(&self) -> String {
+        format!("{PLIST_BASENAME}.display-sync.{}", self.auto_update_name)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -251,6 +264,7 @@ struct LastApplied {
     date: Option<String>,
 }
 
+#[derive(Clone)]
 struct CacheManager {
     base_dir: PathBuf,
 }
@@ -401,6 +415,9 @@ impl CacheManager {
 enum CommandArg {
     EnableAutoUpdate,
     DisableAutoUpdate,
+    EnableDisplaySync,
+    DisableDisplaySync,
+    DisplaySync,
     Info,
     Choose,
     Reapply,
@@ -623,6 +640,19 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
             remove_launchd_plist(&settings)?;
             log("Automatic wallpaper update disabled.", settings.quiet);
             return Ok(());
+        }
+        Some(CommandArg::EnableDisplaySync) => {
+            create_display_sync_plist(&settings, &raw_args)?;
+            log("Display sync enabled.", settings.quiet);
+            return Ok(());
+        }
+        Some(CommandArg::DisableDisplaySync) => {
+            remove_display_sync_plist(&settings)?;
+            log("Display sync disabled.", settings.quiet);
+            return Ok(());
+        }
+        Some(CommandArg::DisplaySync) => {
+            return run_display_sync(&cache, &settings);
         }
         Some(CommandArg::Info) => {
             let stdout = io::stdout();
@@ -1534,6 +1564,161 @@ fn remove_launchd_plist(settings: &Settings) -> Result<()> {
     let _ = fs::remove_file(&plist_path);
     Ok(())
 }
+
+fn create_display_sync_plist(settings: &Settings, raw_args: &[String]) -> Result<()> {
+    fs::create_dir_all(launchd_dir())?;
+
+    let mut filtered_args: Vec<String> = raw_args.to_owned();
+    if let Some(pos) = filtered_args
+        .iter()
+        .position(|arg| arg == "enable-display-sync")
+    {
+        filtered_args.remove(pos);
+    }
+
+    let current_exe = env::current_exe().map_err(|err| {
+        WallpaperError::Message(format!("Unable to determine current executable: {err}"))
+    })?;
+    let mut program_arguments = vec![
+        current_exe.to_string_lossy().to_string(),
+        "display-sync".to_string(),
+    ];
+    program_arguments.extend(filtered_args);
+
+    let mut plist_map: Dictionary = Dictionary::new();
+    plist_map.insert(
+        "Label".into(),
+        Value::String(settings.display_sync_label()),
+    );
+    plist_map.insert("OnDemand".into(), Value::Boolean(true));
+    plist_map.insert(
+        "ProgramArguments".into(),
+        Value::Array(program_arguments.into_iter().map(Value::String).collect()),
+    );
+    let mut env_map: Dictionary = Dictionary::new();
+    env_map.insert("PATH".into(), Value::String(DEFAULT_PATH.to_string()));
+    plist_map.insert("EnvironmentVariables".into(), Value::Dictionary(env_map));
+    plist_map.insert(
+        "StandardErrorPath".into(),
+        Value::String(format!(
+            "/tmp/{PLIST_BASENAME}-display-sync-{}.err",
+            settings.auto_update_name
+        )),
+    );
+    plist_map.insert(
+        "StandardOutPath".into(),
+        Value::String(format!(
+            "/tmp/{PLIST_BASENAME}-display-sync-{}.out",
+            settings.auto_update_name
+        )),
+    );
+    plist_map.insert("KeepAlive".into(), Value::Boolean(true));
+    plist_map.insert("RunAtLoad".into(), Value::Boolean(true));
+
+    let plist_path = settings.display_sync_plist_filename();
+    let value = Value::Dictionary(plist_map);
+    let mut bytes = Vec::new();
+    plist::to_writer_xml(&mut bytes, &value)?;
+    write_bytes_atomic(&plist_path, &bytes)?;
+
+    let _ = Command::new("launchctl")
+        .args(["unload", "-w", plist_path.to_string_lossy().as_ref()])
+        .output();
+    run_checked(
+        "launchctl",
+        &["load", "-w", plist_path.to_string_lossy().as_ref()],
+        "launchctl load",
+    )?;
+    Ok(())
+}
+
+fn remove_display_sync_plist(settings: &Settings) -> Result<()> {
+    let plist_path = settings.display_sync_plist_filename();
+    let _ = Command::new("launchctl")
+        .args(["unload", "-w", plist_path.to_string_lossy().as_ref()])
+        .output();
+    let _ = fs::remove_file(&plist_path);
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn run_display_sync(cache: &CacheManager, settings: &Settings) -> Result<()> {
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let cache = cache.clone();
+    let settings = settings.clone();
+    let quiet = settings.quiet;
+
+    std::thread::spawn(move || {
+        for _ in rx {
+            log("Display change detected; reapplying wallpaper.", settings.quiet);
+            if let Err(err) = reapply_last_wallpaper(&cache, &settings) {
+                log(&format!("Display sync reapply failed: {err}"), settings.quiet);
+            }
+        }
+    });
+
+    let sender = Box::new(tx);
+    let sender_ptr = Box::into_raw(sender) as *mut c_void;
+
+    let err = unsafe { CGDisplayRegisterReconfigurationCallback(display_reconfig_callback, sender_ptr) };
+    if err != 0 {
+        return Err(WallpaperError::Message(format!(
+            "Display sync failed to register callback (error {err})."
+        )));
+    }
+
+    log(
+        "Display sync running; reapplying wallpaper on monitor changes.",
+        quiet,
+    );
+    unsafe {
+        CFRunLoopRun();
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn run_display_sync(_cache: &CacheManager, _settings: &Settings) -> Result<()> {
+    Err(WallpaperError::Message(
+        "Display sync is only supported on macOS.".to_string(),
+    ))
+}
+
+#[cfg(target_os = "macos")]
+type CGDirectDisplayID = u32;
+#[cfg(target_os = "macos")]
+type CGDisplayChangeSummaryFlags = u32;
+#[cfg(target_os = "macos")]
+type CGError = i32;
+
+#[cfg(target_os = "macos")]
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGDisplayRegisterReconfigurationCallback(
+        callback: extern "C" fn(CGDirectDisplayID, CGDisplayChangeSummaryFlags, *mut c_void),
+        user_info: *mut c_void,
+    ) -> CGError;
+}
+
+#[cfg(target_os = "macos")]
+#[link(name = "CoreFoundation", kind = "framework")]
+extern "C" {
+    fn CFRunLoopRun();
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn display_reconfig_callback(
+    _display: CGDirectDisplayID,
+    _flags: CGDisplayChangeSummaryFlags,
+    user_info: *mut c_void,
+) {
+    if user_info.is_null() {
+        return;
+    }
+    let sender = unsafe { &*(user_info as *const std::sync::mpsc::Sender<()>) };
+    let _ = sender.send(());
+}
+
 
 fn wrap_text(text: &str, width: usize) -> Vec<String> {
     let mut lines = Vec::new();
