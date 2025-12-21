@@ -126,6 +126,7 @@ pub(crate) fn fetch_apod_candidate(
         cache,
         settings,
         date_label,
+        date_label,
         apod_settings,
         true,
     )
@@ -135,31 +136,36 @@ fn fetch_apod_candidate_with_fallback(
     client: &Client,
     cache: &CacheManager,
     settings: &Settings,
-    date_label: &str,
+    requested_date_label: &str,
+    apod_date_label: &str,
     apod_settings: &ApodSettings,
     allow_fallback: bool,
 ) -> Result<WallpaperCandidate> {
-    let candidate_id = format!("apod-{date_label}");
-    if let Some(candidate) = cache.find_candidate_by_id(date_label, &candidate_id)? {
+    let candidate_id = format!("apod-{requested_date_label}");
+    if let Some(candidate) = cache.find_candidate_by_id(requested_date_label, &candidate_id)? {
         if candidate.local_path.exists() && (!settings.force || settings.offline) {
             log_verbose(
-                &format!("Using cached APOD wallpaper for {}", date_label),
+                &format!("Using cached APOD wallpaper for {}", requested_date_label),
                 settings,
             );
             return Ok(candidate);
         }
     }
 
+    if let Some(message) = read_apod_skip(cache, requested_date_label, settings) {
+        return Err(WallpaperError::Message(message));
+    }
+
     if settings.offline {
         return Err(WallpaperError::Message(format!(
-            "Offline mode enabled; no cached APOD wallpaper for {date_label}."
+            "Offline mode enabled; no cached APOD wallpaper for {requested_date_label}."
         )));
     }
 
-    let apod = fetch_apod(client, settings, apod_settings, date_label)?;
+    let apod = fetch_apod(client, settings, apod_settings, apod_date_label)?;
     if apod.media_type != "image" {
         if allow_fallback {
-            if let Some(fallback_label) = fallback_date_label(date_label) {
+            if let Some(fallback_label) = fallback_date_label(apod_date_label) {
                 log_verbose(
                     &format!(
                         "APOD media type is not an image; trying {} instead.",
@@ -171,12 +177,14 @@ fn fetch_apod_candidate_with_fallback(
                     client,
                     cache,
                     settings,
+                    requested_date_label,
                     &fallback_label,
                     apod_settings,
                     false,
                 );
             }
         }
+        write_apod_skip(cache, requested_date_label, settings)?;
         return Err(WallpaperError::Message(
             "APOD media type is not an image; skipping.".to_string(),
         ));
@@ -189,9 +197,9 @@ fn fetch_apod_candidate_with_fallback(
         ));
     }
 
-    let media_dir = cache.media_dir(date_label, WallpaperSource::Apod);
+    let media_dir = cache.media_dir(requested_date_label, WallpaperSource::Apod);
     fs::create_dir_all(&media_dir)?;
-    let file_name = format!("apod_{date_label}.jpg");
+    let file_name = format!("apod_{requested_date_label}.jpg");
     let target_path = media_dir.join(file_name);
     let download = download_to_path(client, &image_url, &target_path, settings)?;
 
@@ -204,7 +212,7 @@ fn fetch_apod_candidate_with_fallback(
         info_url: None,
         image_url,
         local_path: download.path,
-        date: date_label.to_string(),
+        date: apod_date_label.to_string(),
         metadata_xml: None,
     };
     log_verbose(
@@ -227,7 +235,7 @@ fn fetch_apod_candidate_with_fallback(
         log_verbose("APOD cropping disabled; using original image.", settings);
     }
 
-    cache.upsert_candidate(date_label, candidate.clone())?;
+    cache.upsert_candidate(requested_date_label, candidate.clone())?;
     Ok(candidate)
 }
 
@@ -248,6 +256,46 @@ fn fetch_apod(
     let body = response.bytes()?.to_vec();
     let parsed: ApodResponse = serde_json::from_slice(&body)?;
     Ok(parsed)
+}
+
+fn apod_skip_path(cache: &CacheManager, date_label: &str) -> std::path::PathBuf {
+    cache
+        .media_dir(date_label, WallpaperSource::Apod)
+        .join("apod_skip.txt")
+}
+
+fn read_apod_skip(
+    cache: &CacheManager,
+    date_label: &str,
+    settings: &Settings,
+) -> Option<String> {
+    if settings.force {
+        return None;
+    }
+    let path = apod_skip_path(cache, date_label);
+    if !path.exists() {
+        return None;
+    }
+    log_verbose(
+        &format!("Using cached APOD skip for {}", date_label),
+        settings,
+    );
+    fs::read_to_string(path)
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| Some("APOD media type is not an image; skipping.".to_string()))
+}
+
+fn write_apod_skip(cache: &CacheManager, date_label: &str, settings: &Settings) -> Result<()> {
+    if settings.force {
+        return Ok(());
+    }
+    let path = apod_skip_path(cache, date_label);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, "APOD media type is not an image; skipping.")?;
+    Ok(())
 }
 
 fn fallback_date_label(date_label: &str) -> Option<String> {
@@ -465,6 +513,19 @@ mod tests {
         assert_eq!(api_mock_today.hits(), 1);
         assert_eq!(api_mock_fallback.hits(), 1);
         assert_eq!(img_mock.hits(), 1);
+
+        let candidate = fetch_apod_candidate(
+            &client,
+            &cache,
+            &settings,
+            date_label,
+            &source_settings.apod,
+        )
+        .unwrap();
+        assert_eq!(candidate.date, "2023-01-02");
+        assert_eq!(api_mock_today.hits(), 1);
+        assert_eq!(api_mock_fallback.hits(), 1);
+        assert_eq!(img_mock.hits(), 1);
     }
 
     #[test]
@@ -508,6 +569,19 @@ mod tests {
         let cache = CacheManager::new(tmpdir.path());
         let client = build_client().unwrap();
         let date_label = "2024-01-02";
+
+        let err = fetch_apod_candidate(
+            &client,
+            &cache,
+            &settings,
+            date_label,
+            &source_settings.apod,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("not an image"));
+        assert_eq!(api_mock_today.hits(), 1);
+        assert_eq!(api_mock_fallback.hits(), 1);
 
         let err = fetch_apod_candidate(
             &client,
