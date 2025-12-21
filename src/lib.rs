@@ -326,6 +326,22 @@ impl CacheManager {
             .find(|cand| cand.source == source))
     }
 
+    fn find_candidates_by_source(
+        &self,
+        date: &str,
+        source: WallpaperSource,
+    ) -> Result<Vec<WallpaperCandidate>> {
+        let index = match self.load_index(date)? {
+            Some(idx) => idx,
+            None => return Ok(Vec::new()),
+        };
+        Ok(index
+            .candidates
+            .into_iter()
+            .filter(|cand| cand.source == source)
+            .collect())
+    }
+
     fn find_candidate_by_id(&self, date: &str, id: &str) -> Result<Option<WallpaperCandidate>> {
         let index = match self.load_index(date)? {
             Some(idx) => idx,
@@ -1807,9 +1823,16 @@ mod tests {
             then.status(200).body("image-bytes");
         });
 
-        let downloaded =
-            bing::download_image(&client, url_base, res, &source_settings.bing, &settings, metadata)
-                .unwrap();
+        let downloaded = bing::download_image(
+            &client,
+            url_base,
+            res,
+            &source_settings.bing,
+            "en-US",
+            &settings,
+            metadata,
+        )
+        .unwrap();
         assert!(downloaded.skipped);
         assert_eq!(downloaded.path, target);
         assert_eq!(_mock.hits(), 0);
@@ -1839,9 +1862,16 @@ mod tests {
             then.status(200).body("image-bytes");
         });
 
-        let downloaded =
-            bing::download_image(&client, url_base, res, &source_settings.bing, &settings, metadata)
-                .unwrap();
+        let downloaded = bing::download_image(
+            &client,
+            url_base,
+            res,
+            &source_settings.bing,
+            "en-US",
+            &settings,
+            metadata,
+        )
+        .unwrap();
         assert!(!downloaded.skipped);
         assert!(downloaded.path.exists());
         assert_eq!(fs::read(&downloaded.path).unwrap(), b"image-bytes");
@@ -1882,6 +1912,7 @@ mod tests {
             url_base,
             res,
             &source_settings.bing,
+            "en-US",
             &settings,
             metadata,
         )

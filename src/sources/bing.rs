@@ -16,7 +16,7 @@ use super::{FetchResult, Source, SourceContext};
 #[derive(Debug, Clone)]
 pub struct BingSettings {
     pub host: String,
-    pub country: Option<String>,
+    pub countries: Vec<String>,
     pub resolutions: Vec<String>,
     pub day: i32,
 }
@@ -26,17 +26,41 @@ pub struct BingConfig {
     #[serde(default)]
     pub country: Option<String>,
     #[serde(default)]
+    pub countries: Option<Vec<String>>,
+    #[serde(default)]
     pub resolutions: Option<Vec<String>>,
 }
 
 impl BingSettings {
     pub fn from_config(config: Option<&crate::AppConfig>) -> Self {
-        let country = config
-            .and_then(|cfg| {
-                cfg.country
-                    .clone()
-                    .or_else(|| cfg.bing.as_ref().and_then(|b| b.country.clone()))
-            });
+        let countries = config
+            .and_then(|cfg| cfg.bing.as_ref().and_then(|b| b.countries.clone()))
+            .filter(|list| !list.is_empty())
+            .or_else(|| {
+                config.and_then(|cfg| {
+                    cfg.bing
+                        .as_ref()
+                        .and_then(|b| b.country.clone())
+                        .or_else(|| cfg.country.clone())
+                        .map(|country| vec![country])
+                })
+            })
+            .unwrap_or_else(|| vec!["en-US".to_string()]);
+
+        let mut normalized: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for country in countries {
+            let trimmed = country.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if seen.insert(trimmed.to_string()) {
+                normalized.push(trimmed.to_string());
+            }
+        }
+        if normalized.is_empty() {
+            normalized.push("en-US".to_string());
+        }
 
         let resolutions = config
             .and_then(|cfg| {
@@ -49,7 +73,7 @@ impl BingSettings {
 
         Self {
             host: "www.bing.com".to_string(),
-            country,
+            countries: normalized,
             resolutions,
             day: 0,
         }
@@ -78,18 +102,51 @@ impl Source for BingSource {
             ctx.source_settings.bing.resolutions.clone()
         };
 
-        let fetched = fetch_bing_candidate(
-            ctx.client,
-            ctx.cache,
-            ctx.settings,
-            ctx.date_label,
-            &ctx.source_settings.bing,
-            resolutions,
-        )?;
-        Ok(FetchResult::single(
-            fetched.candidate,
-            fetched.skipped_download,
-        ))
+        let countries = if ctx.source_settings.bing.countries.is_empty() {
+            vec!["en-US".to_string()]
+        } else {
+            ctx.source_settings.bing.countries.clone()
+        };
+
+        let mut candidates = Vec::new();
+        let mut skipped_download = true;
+        let mut last_error: Option<WallpaperError> = None;
+        let mut seen_images = std::collections::HashSet::new();
+
+        for country in countries {
+            match fetch_bing_candidate(
+                ctx.client,
+                ctx.cache,
+                ctx.settings,
+                ctx.date_label,
+                &ctx.source_settings.bing,
+                &country,
+                resolutions.clone(),
+            ) {
+                Ok(fetched) => {
+                    if !fetched.skipped_download {
+                        skipped_download = false;
+                    }
+                    if seen_images.insert(fetched.candidate.image_url.clone()) {
+                        candidates.push(fetched.candidate);
+                    }
+                }
+                Err(err) => {
+                    last_error = Some(err);
+                }
+            }
+        }
+
+        if candidates.is_empty() {
+            return Err(last_error.unwrap_or_else(|| {
+                WallpaperError::Message("No Bing candidates found.".to_string())
+            }));
+        }
+
+        Ok(FetchResult {
+            candidates,
+            skipped_download,
+        })
     }
 
     fn pick_default<'a>(
@@ -116,15 +173,16 @@ pub(crate) fn fetch_bing_candidate(
     settings: &Settings,
     date_label: &str,
     bing_settings: &BingSettings,
+    country: &str,
     resolutions: Vec<String>,
 ) -> Result<FetchedCandidate> {
-    if let Some(candidate) = cache.find_candidate(date_label, WallpaperSource::Bing)? {
+    if let Some(candidate) = find_cached_candidate_for_country(cache, date_label, country)? {
         if candidate.local_path.exists() && (!settings.force || settings.offline) {
             if settings.offline {
                 log_verbose(
                     &format!(
-                        "Using cached wallpaper for {} from {:?}",
-                        date_label, candidate.source
+                        "Using cached Bing wallpaper for {} ({})",
+                        date_label, country
                     ),
                     settings,
                 );
@@ -144,8 +202,8 @@ pub(crate) fn fetch_bing_candidate(
                 if cached_date == date_label {
                     log_verbose(
                         &format!(
-                            "Using cached wallpaper for {} from {:?}",
-                            date_label, candidate.source
+                            "Using cached Bing wallpaper for {} ({})",
+                            date_label, country
                         ),
                         settings,
                     );
@@ -172,13 +230,13 @@ pub(crate) fn fetch_bing_candidate(
 
     if settings.offline {
         return Err(WallpaperError::Message(format!(
-            "Offline mode enabled; no cached Bing wallpaper for {date_label}."
+            "Offline mode enabled; no cached Bing wallpaper for {date_label} ({country})."
         )));
     }
 
-    let archive_url = build_archive_url(bing_settings.day, bing_settings.country.as_deref());
+    let archive_url = build_archive_url(bing_settings.day, Some(country));
     log_verbose(
-        &format!("Fetching Bing metadata: {}", archive_url),
+        &format!("Fetching Bing metadata ({country}): {}", archive_url),
         settings,
     );
     let (url_base, metadata_body) = fetch_image_metadata(client, &archive_url)?;
@@ -191,12 +249,13 @@ pub(crate) fn fetch_bing_candidate(
             &url_base,
             &res,
             bing_settings,
+            country,
             settings,
             &metadata_body,
         ) {
             Ok(downloaded) => {
                 let candidate = WallpaperCandidate {
-                    id: format!("bing-{date_label}-{res}"),
+                    id: format!("bing-{date_label}-{country}-{res}"),
                     source: WallpaperSource::Bing,
                     title: metadata.headline.clone(),
                     description: None,
@@ -229,6 +288,27 @@ pub(crate) fn fetch_bing_candidate(
             "Unable to download wallpaper for any resolution.".to_string(),
         ))
     }
+}
+
+fn find_cached_candidate_for_country(
+    cache: &CacheManager,
+    date_label: &str,
+    country: &str,
+) -> Result<Option<WallpaperCandidate>> {
+    let candidates = cache.find_candidates_by_source(date_label, WallpaperSource::Bing)?;
+    let prefix = format!("bing-{date_label}-{country}-");
+    if let Some(candidate) = candidates
+        .into_iter()
+        .find(|candidate| candidate.id.starts_with(&prefix))
+    {
+        return Ok(Some(candidate));
+    }
+
+    if country == "en-US" {
+        return cache.find_candidate(date_label, WallpaperSource::Bing);
+    }
+
+    Ok(None)
 }
 
 #[derive(Debug, Default, Clone)]
@@ -341,6 +421,7 @@ pub(crate) fn download_image(
     url_base: &str,
     resolution: &str,
     bing_settings: &BingSettings,
+    country: &str,
     settings: &Settings,
     metadata_body: &[u8],
 ) -> Result<DownloadedImage> {
@@ -361,7 +442,12 @@ pub(crate) fn download_image(
     } else {
         file_url_with_res.replace("/th?id=", "")
     };
-    let filename_local = format!("{}-{filename_local}", settings.auto_update_name);
+    let cleanup_prefix = if bing_settings.countries.len() > 1 {
+        format!("{}-{}", settings.auto_update_name, country)
+    } else {
+        settings.auto_update_name.clone()
+    };
+    let filename_local = format!("{cleanup_prefix}-{filename_local}");
     let target_path = settings.picture_dir.join(filename_local);
 
     if target_path.exists() && !settings.force {
@@ -428,7 +514,7 @@ pub(crate) fn download_image(
             }
             if path.extension().and_then(|ext| ext.to_str()) == Some("jpg") {
                 if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if name.starts_with(&format!("{}-", settings.auto_update_name)) {
+                    if name.starts_with(&format!("{cleanup_prefix}-")) {
                         let _ = fs::remove_file(path);
                     }
                 }

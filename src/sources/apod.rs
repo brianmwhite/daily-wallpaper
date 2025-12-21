@@ -184,7 +184,9 @@ fn fetch_apod_candidate_with_fallback(
                 );
             }
         }
-        write_apod_skip(cache, requested_date_label, settings)?;
+        if !settings.force {
+            write_apod_skip(cache, requested_date_label)?;
+        }
         return Err(WallpaperError::Message(
             "APOD media type is not an image; skipping.".to_string(),
         ));
@@ -286,10 +288,7 @@ fn read_apod_skip(
         .or_else(|| Some("APOD media type is not an image; skipping.".to_string()))
 }
 
-fn write_apod_skip(cache: &CacheManager, date_label: &str, settings: &Settings) -> Result<()> {
-    if settings.force {
-        return Ok(());
-    }
+fn write_apod_skip(cache: &CacheManager, date_label: &str) -> Result<()> {
     let path = apod_skip_path(cache, date_label);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
