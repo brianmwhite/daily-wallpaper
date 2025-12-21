@@ -11,6 +11,7 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 use std::env;
+use chrono::{Datelike, Duration as ChronoDuration, NaiveDate};
 
 use super::{FetchResult, Source, SourceContext};
 
@@ -120,6 +121,24 @@ pub(crate) fn fetch_apod_candidate(
     date_label: &str,
     apod_settings: &ApodSettings,
 ) -> Result<WallpaperCandidate> {
+    fetch_apod_candidate_with_fallback(
+        client,
+        cache,
+        settings,
+        date_label,
+        apod_settings,
+        true,
+    )
+}
+
+fn fetch_apod_candidate_with_fallback(
+    client: &Client,
+    cache: &CacheManager,
+    settings: &Settings,
+    date_label: &str,
+    apod_settings: &ApodSettings,
+    allow_fallback: bool,
+) -> Result<WallpaperCandidate> {
     let candidate_id = format!("apod-{date_label}");
     if let Some(candidate) = cache.find_candidate_by_id(date_label, &candidate_id)? {
         if candidate.local_path.exists() && (!settings.force || settings.offline) {
@@ -139,6 +158,25 @@ pub(crate) fn fetch_apod_candidate(
 
     let apod = fetch_apod(client, settings, apod_settings, date_label)?;
     if apod.media_type != "image" {
+        if allow_fallback {
+            if let Some(fallback_label) = fallback_date_label(date_label) {
+                log_verbose(
+                    &format!(
+                        "APOD media type is not an image; trying {} instead.",
+                        fallback_label
+                    ),
+                    settings,
+                );
+                return fetch_apod_candidate_with_fallback(
+                    client,
+                    cache,
+                    settings,
+                    &fallback_label,
+                    apod_settings,
+                    false,
+                );
+            }
+        }
         return Err(WallpaperError::Message(
             "APOD media type is not an image; skipping.".to_string(),
         ));
@@ -210,6 +248,15 @@ fn fetch_apod(
     let body = response.bytes()?.to_vec();
     let parsed: ApodResponse = serde_json::from_slice(&body)?;
     Ok(parsed)
+}
+
+fn fallback_date_label(date_label: &str) -> Option<String> {
+    let date = NaiveDate::parse_from_str(date_label, "%Y-%m-%d").ok()?;
+    let year = date.year();
+    let fallback = date
+        .with_year(year - 1)
+        .or_else(|| date.checked_sub_signed(ChronoDuration::days(365)))?;
+    Some(fallback.to_string())
 }
 
 fn crop_and_resize_apod(path: &Path) -> Result<()> {
@@ -308,8 +355,33 @@ pub(crate) fn parse_resolution(res_str: &str) -> Option<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sources::SourceSettings;
+    use crate::{build_client, CacheManager, Settings, WallpaperSource, DEFAULT_INFO_WRAP_WIDTH};
+    use httpmock::Method::GET;
+    use httpmock::MockServer;
     use image::{ImageBuffer, Rgba};
+    use std::path::Path;
     use tempfile::tempdir;
+
+    fn make_settings(tmpdir: &Path, force: bool) -> Settings {
+        Settings {
+            proto: "https".into(),
+            picture_dir: tmpdir.to_path_buf(),
+            favorites_dir: tmpdir.join("favorites"),
+            auto_update_name: "default".into(),
+            monitor: 0,
+            force,
+            offline: false,
+            verbose: false,
+            quiet: true,
+            experimental: false,
+            filename: None,
+            source: WallpaperSource::Apod,
+            prune_cache_days: None,
+            info_wrap_width: DEFAULT_INFO_WRAP_WIDTH,
+            info_plain_text: false,
+        }
+    }
 
     #[test]
     fn crop_and_resize_handles_rgba_by_saving_jpeg() {
@@ -328,5 +400,126 @@ mod tests {
             .decode()
             .unwrap();
         assert!(!loaded.color().has_alpha(), "should be RGB after re-save");
+    }
+
+    #[test]
+    fn apod_falls_back_one_year_on_video() {
+        let server = MockServer::start();
+        let api_url = server.url("/apod");
+        let img_url = server.url("/image.jpg");
+
+        let api_mock_today = server.mock(|when, then| {
+            when.method(GET)
+                .path("/apod")
+                .query_param("api_key", "TEST")
+                .query_param("date", "2024-01-02");
+            then.status(200).body(
+                r#"{
+                "url":"https://example.com/video.mp4",
+                "media_type":"video",
+                "title":"vid"
+            }"#,
+            );
+        });
+        let api_mock_fallback = server.mock(|when, then| {
+            when.method(GET)
+                .path("/apod")
+                .query_param("api_key", "TEST")
+                .query_param("date", "2023-01-02");
+            then.status(200).body(
+                r#"{
+                "url":"IMAGE_URL",
+                "media_type":"image",
+                "title":"nebula",
+                "explanation":"desc"
+            }"#
+                .replace("IMAGE_URL", &img_url),
+            );
+        });
+        let img_mock = server.mock(|when, then| {
+            when.method(GET).path("/image.jpg");
+            then.status(200).body("img-bytes");
+        });
+
+        let tmpdir = tempdir().unwrap();
+        let settings = make_settings(tmpdir.path(), false);
+        let mut source_settings = SourceSettings::from_config(None).unwrap();
+        source_settings.apod.api_key = "TEST".into();
+        source_settings.apod.url_override = Some(api_url);
+        source_settings.apod.crop = false;
+
+        let cache = CacheManager::new(tmpdir.path());
+        let client = build_client().unwrap();
+        let date_label = "2024-01-02";
+
+        let candidate = fetch_apod_candidate(
+            &client,
+            &cache,
+            &settings,
+            date_label,
+            &source_settings.apod,
+        )
+        .unwrap();
+
+        assert_eq!(candidate.date, "2023-01-02");
+        assert_eq!(api_mock_today.hits(), 1);
+        assert_eq!(api_mock_fallback.hits(), 1);
+        assert_eq!(img_mock.hits(), 1);
+    }
+
+    #[test]
+    fn apod_errors_on_video() {
+        let server = MockServer::start();
+        let api_url = server.url("/apod");
+        let api_mock_today = server.mock(|when, then| {
+            when.method(GET)
+                .path("/apod")
+                .query_param("api_key", "TEST")
+                .query_param("date", "2024-01-02");
+            then.status(200).body(
+                r#"{
+                "url":"https://example.com/video.mp4",
+                "media_type":"video",
+                "title":"vid"
+            }"#,
+            );
+        });
+        let api_mock_fallback = server.mock(|when, then| {
+            when.method(GET)
+                .path("/apod")
+                .query_param("api_key", "TEST")
+                .query_param("date", "2023-01-02");
+            then.status(200).body(
+                r#"{
+                "url":"https://example.com/video2.mp4",
+                "media_type":"video",
+                "title":"vid2"
+            }"#,
+            );
+        });
+
+        let tmpdir = tempdir().unwrap();
+        let settings = make_settings(tmpdir.path(), false);
+        let mut source_settings = SourceSettings::from_config(None).unwrap();
+        source_settings.apod.api_key = "TEST".into();
+        source_settings.apod.url_override = Some(api_url);
+        source_settings.apod.crop = false;
+
+        let cache = CacheManager::new(tmpdir.path());
+        let client = build_client().unwrap();
+        let date_label = "2024-01-02";
+
+        let err = fetch_apod_candidate(
+            &client,
+            &cache,
+            &settings,
+            date_label,
+            &source_settings.apod,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("not an image"));
+        assert_eq!(api_mock_today.hits(), 1);
+        assert_eq!(api_mock_fallback.hits(), 1);
     }
 }

@@ -2162,50 +2162,6 @@ mod tests {
     }
 
     #[test]
-    fn apod_errors_on_video() {
-        let server = MockServer::start();
-        let api_url = server.url("/apod");
-        let api_mock = server.mock(|when, then| {
-            when.method(GET)
-                .path("/apod")
-                .query_param("api_key", "TEST")
-                .query_param("date", "2024-01-02");
-            then.status(200).body(
-                r#"{
-                "url":"https://example.com/video.mp4",
-                "media_type":"video",
-                "title":"vid"
-            }"#,
-            );
-        });
-
-        let tmpdir = tempdir().unwrap();
-        let mut settings = make_settings(tmpdir.path(), None, false);
-        settings.source = WallpaperSource::Apod;
-        let mut source_settings = SourceSettings::from_config(None).unwrap();
-        source_settings.apod.api_key = "TEST".into();
-        source_settings.apod.url_override = Some(api_url);
-        source_settings.apod.crop = false;
-
-        let cache = CacheManager::new(tmpdir.path());
-        let client = build_client().unwrap();
-        let date_label = "2024-01-02";
-
-        let err = run_source_for_test(
-            WallpaperSource::Apod,
-            &client,
-            &cache,
-            &settings,
-            date_label,
-            &source_settings,
-        )
-        .unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains("not an image"));
-        assert_eq!(api_mock.hits(), 1);
-    }
-
-    #[test]
     fn cache_manager_upserts_and_loads_candidate() {
         let tmpdir = tempdir().unwrap();
         let cache = CacheManager::new(tmpdir.path());
