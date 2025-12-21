@@ -649,6 +649,19 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
         None => {}
     }
 
+    if !settings.force {
+        if let Some(last) = cache.read_last_applied()? {
+            let today = Local::now().date_naive().to_string();
+            if last.date.as_deref() == Some(today.as_str()) {
+                log(
+                    "Wallpaper already set today; skipping auto update.",
+                    settings.quiet,
+                );
+                return Ok(());
+            }
+        }
+    }
+
     ensure_picture_dir(&settings.picture_dir)?;
 
     let source = require_source(&registry, settings.source)?;
