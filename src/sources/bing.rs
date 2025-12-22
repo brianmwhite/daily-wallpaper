@@ -241,6 +241,7 @@ pub(crate) fn fetch_bing_candidate(
     );
     let (url_base, metadata_body) = fetch_image_metadata(client, &archive_url)?;
     let metadata = parse_bing_metadata(&metadata_body)?;
+    let metadata_date = metadata_date_label(&metadata_body).ok().and_then(|date| date);
 
     let mut last_error: Option<WallpaperError> = None;
     for res in resolutions {
@@ -254,6 +255,8 @@ pub(crate) fn fetch_bing_candidate(
             &metadata_body,
         ) {
             Ok(downloaded) => {
+                let candidate_date =
+                    metadata_date.clone().unwrap_or_else(|| date_label.to_string());
                 let candidate = WallpaperCandidate {
                     id: format!("bing-{date_label}-{country}-{res}"),
                     source: WallpaperSource::Bing,
@@ -263,7 +266,7 @@ pub(crate) fn fetch_bing_candidate(
                     info_url: metadata.copyright_link.clone(),
                     image_url: downloaded.image_url.clone(),
                     local_path: downloaded.path.clone(),
-                    date: date_label.to_string(),
+                    date: candidate_date,
                     metadata_xml: Some(String::from_utf8_lossy(&metadata_body).to_string()),
                 };
 
@@ -385,7 +388,7 @@ fn normalize_startdate(startdate: &str) -> Option<String> {
     ))
 }
 
-fn metadata_date_label(body: &[u8]) -> Result<Option<String>> {
+pub(crate) fn metadata_date_label(body: &[u8]) -> Result<Option<String>> {
     let startdate = parse_xml_text(body, "startdate")?;
     Ok(startdate.and_then(|raw| normalize_startdate(&raw)))
 }

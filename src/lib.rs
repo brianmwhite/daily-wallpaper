@@ -682,7 +682,25 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
     if !settings.force {
         if let Some(last) = cache.read_last_applied()? {
             let today = Local::now().date_naive().to_string();
-            if last.date.as_deref() == Some(today.as_str()) {
+            let mut last_date = last.date.clone();
+            if last.source == WallpaperSource::Bing {
+                let cached_candidate = last
+                    .date
+                    .as_deref()
+                    .and_then(|date| cache.find_candidate_by_id(date, &last.candidate_id).ok())
+                    .flatten()
+                    .or_else(|| cache.find_candidate_any_date(&last.candidate_id).ok().flatten());
+                if let Some(candidate) = cached_candidate {
+                    if let Some(xml) = candidate.metadata_xml.as_deref() {
+                        if let Ok(Some(metadata_date)) =
+                            sources::bing::metadata_date_label(xml.as_bytes())
+                        {
+                            last_date = Some(metadata_date);
+                        }
+                    }
+                }
+            }
+            if last_date.as_deref() == Some(today.as_str()) {
                 log(
                     "Wallpaper already set today; skipping auto update.",
                     settings.quiet,
@@ -883,6 +901,17 @@ fn run_choose(
 ) -> Result<()> {
     let mut current_settings = settings.clone();
     let mut selected_idx: Option<usize> = None;
+    let mut candidates_cache: Vec<WallpaperCandidate> = Vec::new();
+    let mut candidates_dirty = true;
+
+    let normalize_label = |value: &str| {
+        value
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .trim()
+            .to_string()
+    };
 
     loop {
         let favorite_entries = favorites.load_all()?;
@@ -890,10 +919,14 @@ fn run_choose(
             .iter()
             .map(|f| f.id.clone())
             .collect();
-        let candidates =
-            gather_candidates(client, cache, registry, &current_settings, source_settings)?;
-        // Force should be one-shot in the chooser to avoid repeated re-downloads.
-        current_settings.force = false;
+        if candidates_dirty {
+            candidates_cache =
+                gather_candidates(client, cache, registry, &current_settings, source_settings)?;
+            // Force should be one-shot in the chooser to avoid repeated re-downloads.
+            current_settings.force = false;
+            candidates_dirty = false;
+        }
+        let candidates = &candidates_cache;
         if candidates.is_empty() && favorite_entries.is_empty() {
             return Err(WallpaperError::Message(
                 "No wallpapers available to choose from.".to_string(),
@@ -907,13 +940,15 @@ fn run_choose(
                 let title = cand
                     .title
                     .as_deref()
+                    .map(normalize_label)
                     .filter(|t| !t.is_empty())
-                    .unwrap_or("(no title)");
+                    .unwrap_or_else(|| "(no title)".to_string());
                 let attribution = cand
                     .attribution
                     .as_deref()
+                    .map(normalize_label)
                     .filter(|t| !t.is_empty())
-                    .unwrap_or("");
+                    .unwrap_or_else(String::new);
                 let favorite_marker = if favorite_ids.contains(&cand.id) {
                     " [fav]"
                 } else {
@@ -1029,6 +1064,7 @@ fn run_choose(
                     }
                     Ok(choice) if choice.starts_with("Refresh") => {
                         current_settings.force = true;
+                        candidates_dirty = true;
                         break;
                     }
                     Ok(choice) if choice.starts_with("Quit") => return Ok(()),
