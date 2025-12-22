@@ -4,11 +4,12 @@ use crate::{
     WallpaperSource, DEFAULT_RESOLUTIONS, IMAGE_TIMEOUT, METADATA_TIMEOUT,
 };
 use reqwest::blocking::Client;
+use sha2::{Digest, Sha256};
 use serde::Deserialize;
 use roxmltree;
 use std::ffi::OsStr;
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use super::{FetchResult, Source, SourceContext};
@@ -127,7 +128,8 @@ impl Source for BingSource {
                     if !fetched.skipped_download {
                         skipped_download = false;
                     }
-                    if seen_images.insert(fetched.candidate.image_url.clone()) {
+                    let dedupe_key = candidate_dedupe_key(&fetched.candidate);
+                    if seen_images.insert(dedupe_key) {
                         candidates.push(fetched.candidate);
                     }
                 }
@@ -176,8 +178,30 @@ pub(crate) fn fetch_bing_candidate(
     country: &str,
     resolutions: Vec<String>,
 ) -> Result<FetchedCandidate> {
-    if let Some(candidate) = find_cached_candidate_for_country(cache, date_label, country)? {
+    if let Some(mut candidate) =
+        find_cached_candidate_for_country(cache, date_label, country, &resolutions)?
+    {
         if candidate.local_path.exists() && (!settings.force || settings.offline) {
+            if candidate.checksum.is_none() {
+                if let Ok(Some(checksum)) = compute_checksum(&candidate.local_path) {
+                    candidate.checksum = Some(checksum);
+                    cache.upsert_candidate(date_label, candidate.clone())?;
+                }
+            }
+            if !settings.refresh_metadata && !settings.offline {
+                log_verbose(
+                    &format!(
+                        "Using cached Bing wallpaper for {} ({})",
+                        date_label, country
+                    ),
+                    settings,
+                );
+                ensure_info_file(&candidate)?;
+                return Ok(FetchedCandidate {
+                    candidate,
+                    skipped_download: true,
+                });
+            }
             if settings.offline {
                 log_verbose(
                     &format!(
@@ -270,6 +294,7 @@ pub(crate) fn fetch_bing_candidate(
                     local_path: downloaded.path.clone(),
                     date: candidate_date,
                     metadata_xml: Some(String::from_utf8_lossy(&metadata_body).to_string()),
+                    checksum: downloaded.checksum.clone(),
                 };
 
                 cache.upsert_candidate(date_label, candidate.clone())?;
@@ -306,21 +331,59 @@ fn find_cached_candidate_for_country(
     cache: &CacheManager,
     date_label: &str,
     country: &str,
+    resolutions: &[String],
 ) -> Result<Option<WallpaperCandidate>> {
     let candidates = cache.find_candidates_by_source(date_label, WallpaperSource::Bing)?;
     let prefix = format!("bing-{date_label}-{country}-");
-    if let Some(candidate) = candidates
+    let mut matches: Vec<WallpaperCandidate> = candidates
         .into_iter()
-        .find(|candidate| candidate.id.starts_with(&prefix))
-    {
-        return Ok(Some(candidate));
+        .filter(|candidate| candidate.id.starts_with(&prefix))
+        .collect();
+
+    if matches.is_empty() && country == "en-US" {
+        if let Some(candidate) = cache.find_candidate(date_label, WallpaperSource::Bing)? {
+            matches.push(candidate);
+        }
     }
 
-    if country == "en-US" {
-        return cache.find_candidate(date_label, WallpaperSource::Bing);
+    if matches.is_empty() {
+        return Ok(None);
     }
 
-    Ok(None)
+    let cache_dir = cache.media_dir(date_label, WallpaperSource::Bing);
+    let mut preferred: Vec<WallpaperCandidate> = matches
+        .iter()
+        .cloned()
+        .filter(|candidate| candidate.local_path.exists())
+        .collect();
+
+    if preferred.is_empty() {
+        return Ok(matches.into_iter().next());
+    }
+
+    let in_cache: Vec<WallpaperCandidate> = preferred
+        .iter()
+        .cloned()
+        .filter(|candidate| candidate.local_path.starts_with(&cache_dir))
+        .collect();
+    if !in_cache.is_empty() {
+        preferred = in_cache;
+    }
+
+    let resolution_rank = |candidate: &WallpaperCandidate| -> usize {
+        let res = candidate
+            .id
+            .rsplitn(2, '-')
+            .next()
+            .unwrap_or_default();
+        resolutions
+            .iter()
+            .position(|item| item == res)
+            .unwrap_or(usize::MAX)
+    };
+
+    preferred.sort_by_key(|candidate| resolution_rank(candidate));
+    Ok(preferred.into_iter().next())
 }
 
 #[derive(Debug, Default, Clone)]
@@ -328,6 +391,106 @@ pub(crate) struct BingMetadata {
     pub headline: Option<String>,
     pub copyright: Option<String>,
     pub copyright_link: Option<String>,
+}
+
+fn candidate_dedupe_key(candidate: &WallpaperCandidate) -> String {
+    if let Some(checksum) = candidate.checksum.as_deref() {
+        return checksum.to_string();
+    }
+
+    if let Some(xml) = candidate.metadata_xml.as_deref() {
+        if let Ok(Some(url_base)) = parse_xml_text(xml.as_bytes(), "urlBase") {
+            return url_base;
+        }
+        if let Ok(Some(hash)) = parse_xml_text(xml.as_bytes(), "hsh") {
+            return hash;
+        }
+    }
+
+    if let Some(start) = candidate.image_url.find("/th?id=") {
+        let tail = &candidate.image_url[start..];
+        if let Some((base, _)) = tail.split_once('_') {
+            return base.to_string();
+        }
+        return tail.to_string();
+    }
+
+    candidate.image_url.clone()
+}
+
+fn compute_checksum(path: &Path) -> Result<Option<String>> {
+    let mut file = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(err) => {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                return Ok(None);
+            }
+            return Err(err.into());
+        }
+    };
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+    }
+    let digest = hasher.finalize();
+    Ok(Some(format!("{:x}", digest)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn candidate_dedupe_key_uses_url_base_from_metadata() {
+        let xml = include_str!("../../docs/bing.xml");
+        let candidate = WallpaperCandidate {
+            id: "bing-2025-12-22-en-US-1920x1080".into(),
+            source: WallpaperSource::Bing,
+            title: None,
+            description: None,
+            attribution: None,
+            info_url: None,
+            image_url: "https://www.bing.com/th?id=OHR.NutcrackerAnkara_EN-US5537620581_1920x1080.jpg".into(),
+            local_path: PathBuf::from("dummy.jpg"),
+            date: "2025-12-22".into(),
+            metadata_xml: Some(xml.to_string()),
+            checksum: None,
+        };
+
+        let key = candidate_dedupe_key(&candidate);
+        assert_eq!(key, "/th?id=OHR.NutcrackerAnkara_EN-US5537620581");
+    }
+
+    #[test]
+    fn candidate_dedupe_key_prefers_checksum_when_file_exists() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wallpaper.jpg");
+        fs::write(&path, b"same-image").unwrap();
+
+        let checksum = compute_checksum(&path).unwrap().unwrap();
+        let candidate = WallpaperCandidate {
+            id: "bing-2025-12-22-es-1920x1080".into(),
+            source: WallpaperSource::Bing,
+            title: None,
+            description: None,
+            attribution: None,
+            info_url: None,
+            image_url: "https://www.bing.com/th?id=OHR.DifferentId_1920x1080.jpg".into(),
+            local_path: path.clone(),
+            date: "2025-12-22".into(),
+            metadata_xml: None,
+            checksum: Some(checksum.clone()),
+        };
+
+        let key = candidate_dedupe_key(&candidate);
+        assert_eq!(key, checksum);
+    }
 }
 
 pub(crate) fn build_archive_url(day: i32, country: Option<&str>) -> String {
@@ -426,6 +589,7 @@ pub(crate) struct DownloadedImage {
     pub path: PathBuf,
     pub skipped: bool,
     pub image_url: String,
+    pub checksum: Option<String>,
 }
 
 pub(crate) fn download_image(
@@ -474,10 +638,12 @@ pub(crate) fn download_image(
             &format!("Skipping download, already present: {name}"),
             settings,
         );
+        let checksum = compute_checksum(&target_path)?;
         return Ok(DownloadedImage {
             path: target_path,
             skipped: true,
             image_url: file_url,
+            checksum,
         });
     }
 
@@ -555,9 +721,12 @@ pub(crate) fn download_image(
         false,
     );
 
+    let checksum = compute_checksum(&target_path)?;
+
     Ok(DownloadedImage {
         path: target_path,
         skipped: false,
         image_url: file_url,
+        checksum,
     })
 }

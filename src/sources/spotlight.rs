@@ -236,6 +236,7 @@ pub(crate) fn fetch_spotlight_candidates(
             local_path: download.path,
             date: date_label.to_string(),
             metadata_xml: None,
+            checksum: None,
         };
         cache.upsert_candidate(date_label, candidate.clone())?;
         candidates.push(candidate);

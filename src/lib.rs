@@ -169,6 +169,7 @@ struct Settings {
     prune_cache_days: Option<u32>,
     info_wrap_width: usize,
     info_plain_text: bool,
+    refresh_metadata: bool,
 }
 
 impl Settings {
@@ -204,6 +205,7 @@ struct WallpaperCandidate {
     local_path: PathBuf,
     date: String,
     metadata_xml: Option<String>,
+    checksum: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -616,6 +618,7 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
         prune_cache_days,
         info_wrap_width,
         info_plain_text,
+        refresh_metadata: true,
     };
 
     if settings.offline && settings.force {
@@ -903,6 +906,7 @@ fn run_choose(
     let mut selected_idx: Option<usize> = None;
     let mut candidates_cache: Vec<WallpaperCandidate> = Vec::new();
     let mut candidates_dirty = true;
+    current_settings.refresh_metadata = false;
 
     let normalize_label = |value: &str| {
         value
@@ -924,6 +928,7 @@ fn run_choose(
                 gather_candidates(client, cache, registry, &current_settings, source_settings)?;
             // Force should be one-shot in the chooser to avoid repeated re-downloads.
             current_settings.force = false;
+            current_settings.refresh_metadata = false;
             candidates_dirty = false;
         }
         let candidates = &candidates_cache;
@@ -1064,6 +1069,7 @@ fn run_choose(
                     }
                     Ok(choice) if choice.starts_with("Refresh") => {
                         current_settings.force = true;
+                        current_settings.refresh_metadata = true;
                         candidates_dirty = true;
                         break;
                     }
@@ -1988,6 +1994,7 @@ mod tests {
             prune_cache_days: None,
             info_wrap_width: DEFAULT_INFO_WRAP_WIDTH,
             info_plain_text: false,
+            refresh_metadata: true,
         }
     }
 
@@ -2472,6 +2479,7 @@ mod tests {
             local_path: tmpdir.path().join("wallpaper.jpg"),
             date: "2024-01-01".into(),
             metadata_xml: Some("<xml>meta</xml>".into()),
+            checksum: None,
         };
 
         cache
@@ -2503,6 +2511,7 @@ mod tests {
             local_path: media_dir.join("wallpaper2.jpg"),
             date: date_label.into(),
             metadata_xml: Some("<xml>info</xml>".into()),
+            checksum: None,
         };
 
         let info_path = media_dir.join("info.xml");
@@ -2528,6 +2537,7 @@ mod tests {
             local_path: tmpdir.path().join("spotlight.jpg"),
             date: "2024-02-01".into(),
             metadata_xml: None,
+            checksum: None,
         };
 
         cache
@@ -2581,6 +2591,7 @@ mod tests {
             local_path: img_path,
             date: "2024-01-01".into(),
             metadata_xml: Some("<xml>meta</xml>".into()),
+            checksum: None,
         }
     }
 

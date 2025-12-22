@@ -216,6 +216,7 @@ fn fetch_apod_candidate_with_fallback(
         local_path: download.path,
         date: apod_date_label.to_string(),
         metadata_xml: None,
+        checksum: None,
     };
     log_verbose(
         &format!("APOD image URL: {}", candidate.image_url),
@@ -427,6 +428,7 @@ mod tests {
             prune_cache_days: None,
             info_wrap_width: DEFAULT_INFO_WRAP_WIDTH,
             info_plain_text: false,
+            refresh_metadata: true,
         }
     }
 
