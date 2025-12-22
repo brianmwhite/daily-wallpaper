@@ -429,6 +429,7 @@ mod tests {
             info_wrap_width: DEFAULT_INFO_WRAP_WIDTH,
             info_plain_text: false,
             refresh_metadata: true,
+            min_resolution: None,
         }
     }
 

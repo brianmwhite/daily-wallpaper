@@ -128,6 +128,9 @@ picture_dir = "~/Pictures/daily-wallpapers"
 # Favorites directory (defaults to <picture_dir>/favorites)
 favorites_dir = "~/Pictures/daily-wallpapers/favorites"
 
+# Minimum resolution for downloaded wallpapers (WIDTHxHEIGHT)
+min_resolution = "1920x1080"
+
 # Verbosity: quiet | normal | verbose
 verbosity = "normal"
 

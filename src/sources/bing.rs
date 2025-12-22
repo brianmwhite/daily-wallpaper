@@ -704,6 +704,10 @@ pub(crate) fn download_image(
         }
 
         fs::rename(&temp_path, &target_path)?;
+        if let Err(err) = crate::enforce_min_resolution(&target_path, settings) {
+            let _ = fs::remove_file(&target_path);
+            return Err(err);
+        }
         write_bytes_atomic(&target_dir.join("info.xml"), metadata_body)?;
         Ok(())
     })();

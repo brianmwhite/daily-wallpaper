@@ -7,6 +7,7 @@ use reqwest::StatusCode;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json;
+use image::image_dimensions;
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File};
@@ -170,6 +171,7 @@ struct Settings {
     info_wrap_width: usize,
     info_plain_text: bool,
     refresh_metadata: bool,
+    min_resolution: Option<(u32, u32)>,
 }
 
 impl Settings {
@@ -205,6 +207,7 @@ struct WallpaperCandidate {
     local_path: PathBuf,
     date: String,
     metadata_xml: Option<String>,
+    #[serde(default)]
     checksum: Option<String>,
 }
 
@@ -240,6 +243,8 @@ struct AppConfig {
     info_wrap_width: Option<usize>,
     #[serde(default)]
     info_plain_text: Option<bool>,
+    #[serde(default)]
+    min_resolution: Option<String>,
     #[serde(default)]
     apod_api_key: Option<String>,
     #[serde(default)]
@@ -518,6 +523,10 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
     };
 
     let source_settings = SourceSettings::from_config(config.as_ref())?;
+    let min_resolution = config
+        .as_ref()
+        .and_then(|cfg| cfg.min_resolution.as_deref())
+        .and_then(parse_resolution);
 
     let mut quiet = args.quiet;
     let mut verbose = args.verbose;
@@ -619,6 +628,7 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
         info_wrap_width,
         info_plain_text,
         refresh_metadata: true,
+        min_resolution,
     };
 
     if settings.offline && settings.force {
@@ -791,6 +801,14 @@ fn normalize_auto_update_name(name: &str) -> String {
         .collect()
 }
 
+fn parse_resolution(value: &str) -> Option<(u32, u32)> {
+    let normalized = value.trim().to_lowercase();
+    let (width, height) = normalized.split_once('x')?;
+    let width = width.trim().parse::<u32>().ok()?;
+    let height = height.trim().parse::<u32>().ok()?;
+    Some((width, height))
+}
+
 fn log(message: &str, quiet: bool) {
     if quiet {
         return;
@@ -865,7 +883,9 @@ fn date_label_for(
 }
 
 fn run_source(source: &dyn Source, ctx: &SourceContext<'_>) -> Result<()> {
-    let fetch_result = source.fetch(ctx)?;
+    let mut fetch_result = source.fetch(ctx)?;
+    fetch_result.candidates =
+        filter_candidates_by_min_resolution(fetch_result.candidates, ctx.settings)?;
     let candidate = source
         .pick_default(&fetch_result.candidates, ctx)?
         .clone();
@@ -892,6 +912,51 @@ fn require_source<'a>(registry: &'a SourceRegistry, id: WallpaperSource) -> Resu
     registry
         .get(id)
         .ok_or_else(|| WallpaperError::Message(format!("Source {:?} is not registered.", id)))
+}
+
+fn filter_candidates_by_min_resolution(
+    candidates: Vec<WallpaperCandidate>,
+    settings: &Settings,
+) -> Result<Vec<WallpaperCandidate>> {
+    let Some((min_width, min_height)) = settings.min_resolution else {
+        return Ok(candidates);
+    };
+
+    let mut filtered = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let (width, height) = match image_dimensions(&candidate.local_path) {
+            Ok(dim) => dim,
+            Err(err) => {
+                log_verbose(
+                    &format!(
+                        "Skipping {} ({}): could not read dimensions: {err}",
+                        candidate.id,
+                        candidate.local_path.display()
+                    ),
+                    settings,
+                );
+                continue;
+            }
+        };
+        if width < min_width || height < min_height {
+            log_verbose(
+                &format!(
+                    "Skipping {} ({}): {}x{} below minimum {}x{}.",
+                    candidate.id,
+                    candidate.local_path.display(),
+                    width,
+                    height,
+                    min_width,
+                    min_height
+                ),
+                settings,
+            );
+            continue;
+        }
+        filtered.push(candidate);
+    }
+
+    Ok(filtered)
 }
 
 fn run_choose(
@@ -924,8 +989,10 @@ fn run_choose(
             .map(|f| f.id.clone())
             .collect();
         if candidates_dirty {
-            candidates_cache =
-                gather_candidates(client, cache, registry, &current_settings, source_settings)?;
+            candidates_cache = filter_candidates_by_min_resolution(
+                gather_candidates(client, cache, registry, &current_settings, source_settings)?,
+                &current_settings,
+            )?;
             // Force should be one-shot in the chooser to avoid repeated re-downloads.
             current_settings.force = false;
             current_settings.refresh_metadata = false;
@@ -1282,6 +1349,10 @@ fn download_to_path(
         file.flush()?;
         file.sync_all()?;
         fs::rename(&temp_path, target_path)?;
+        if let Err(err) = enforce_min_resolution(target_path, settings) {
+            let _ = fs::remove_file(target_path);
+            return Err(err);
+        }
         Ok(())
     })();
 
@@ -1301,6 +1372,45 @@ fn download_to_path(
     Ok(DownloadedFile {
         path: target_path.to_path_buf(),
     })
+}
+
+pub(crate) fn enforce_min_resolution(path: &Path, settings: &Settings) -> Result<()> {
+    let Some((min_width, min_height)) = settings.min_resolution else {
+        return Ok(());
+    };
+
+    let (width, height) = match image_dimensions(path) {
+        Ok(dim) => dim,
+        Err(err) => {
+            log_verbose(
+                &format!(
+                    "Could not read image dimensions for {}: {err}",
+                    path.display()
+                ),
+                settings,
+            );
+            return Err(WallpaperError::Message(format!(
+                "Unable to read image dimensions for {}.",
+                path.display()
+            )));
+        }
+    };
+
+    if width < min_width || height < min_height {
+        log_verbose(
+            &format!(
+                "Downloaded image {}x{} below minimum {}x{}; skipping.",
+                width, height, min_width, min_height
+            ),
+            settings,
+        );
+        return Err(WallpaperError::Message(format!(
+            "Downloaded image {}x{} below minimum {}x{}.",
+            width, height, min_width, min_height
+        )));
+    }
+
+    Ok(())
 }
 
 fn unique_temp_path(target_path: &Path) -> PathBuf {
@@ -1995,6 +2105,7 @@ mod tests {
             info_wrap_width: DEFAULT_INFO_WRAP_WIDTH,
             info_plain_text: false,
             refresh_metadata: true,
+            min_resolution: None,
         }
     }
 
