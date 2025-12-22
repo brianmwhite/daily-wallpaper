@@ -1437,8 +1437,11 @@ fn reapply_last_wallpaper(cache: &CacheManager, settings: &Settings) -> Result<(
     )
 }
 
-fn ensure_info_file(picture_dir: &Path, candidate: &WallpaperCandidate) -> Result<()> {
-    let info_path = picture_dir.join("info.xml");
+fn ensure_info_file(candidate: &WallpaperCandidate) -> Result<()> {
+    let Some(parent) = candidate.local_path.parent() else {
+        return Ok(());
+    };
+    let info_path = parent.join("info.xml");
     if info_path.exists() {
         return Ok(());
     }
@@ -2035,8 +2038,10 @@ mod tests {
         let metadata = b"<xml />";
         let res = "1920x1080";
         let url_base = "/th?id=test";
+        let date_label = "2024-01-01";
 
         let tmpdir = tempdir().unwrap();
+        let cache = CacheManager::new(tmpdir.path());
         let settings = Settings {
             proto: "http".into(),
             ..make_settings(tmpdir.path(), None, false)
@@ -2044,11 +2049,13 @@ mod tests {
         let mut source_settings = SourceSettings::from_config(None).unwrap();
         source_settings.bing.host = server.address().to_string();
 
-        let target = tmpdir.path().join(format!(
+        let target_dir = cache.media_dir(date_label, WallpaperSource::Bing);
+        let target = target_dir.join(format!(
             "default-{}_{}.jpg",
             url_base.replace("/th?id=", ""),
             res
         ));
+        fs::create_dir_all(&target_dir).unwrap();
         fs::write(&target, b"existing").unwrap();
 
         let client = build_client().unwrap();
@@ -2065,6 +2072,8 @@ mod tests {
             "en-US",
             &settings,
             metadata,
+            &cache,
+            date_label,
         )
         .unwrap();
         assert!(downloaded.skipped);
@@ -2078,8 +2087,10 @@ mod tests {
         let metadata = b"<xml>meta</xml>";
         let res = "1920x1080";
         let url_base = "/th?id=test";
+        let date_label = "2024-01-01";
 
         let tmpdir = tempdir().unwrap();
+        let cache = CacheManager::new(tmpdir.path());
         let settings = Settings {
             proto: "http".into(),
             ..make_settings(tmpdir.path(), None, false)
@@ -2087,7 +2098,9 @@ mod tests {
         let mut source_settings = SourceSettings::from_config(None).unwrap();
         source_settings.bing.host = server.address().to_string();
 
-        let old_wallpaper = tmpdir.path().join("default-old.jpg");
+        let target_dir = cache.media_dir(date_label, WallpaperSource::Bing);
+        fs::create_dir_all(&target_dir).unwrap();
+        let old_wallpaper = target_dir.join("default-old.jpg");
         fs::write(&old_wallpaper, b"old").unwrap();
 
         let client = build_client().unwrap();
@@ -2104,13 +2117,15 @@ mod tests {
             "en-US",
             &settings,
             metadata,
+            &cache,
+            date_label,
         )
         .unwrap();
         assert!(!downloaded.skipped);
         assert!(downloaded.path.exists());
         assert_eq!(fs::read(&downloaded.path).unwrap(), b"image-bytes");
         assert!(!old_wallpaper.exists());
-        assert_eq!(fs::read(tmpdir.path().join("info.xml")).unwrap(), metadata);
+        assert_eq!(fs::read(target_dir.join("info.xml")).unwrap(), metadata);
         assert_eq!(_mock.hits(), 1);
     }
 
@@ -2120,8 +2135,10 @@ mod tests {
         let metadata = b"meta";
         let res = "1920x1080";
         let url_base = "/th?id=test";
+        let date_label = "2024-01-01";
 
         let tmpdir = tempdir().unwrap();
+        let cache = CacheManager::new(tmpdir.path());
         let settings = Settings {
             proto: "http".into(),
             ..make_settings(tmpdir.path(), None, false)
@@ -2129,7 +2146,8 @@ mod tests {
         let mut source_settings = SourceSettings::from_config(None).unwrap();
         source_settings.bing.host = server.address().to_string();
 
-        let target = tmpdir.path().join(format!(
+        let target_dir = cache.media_dir(date_label, WallpaperSource::Bing);
+        let target = target_dir.join(format!(
             "default-{}_{}.jpg",
             url_base.replace("/th?id=", ""),
             res
@@ -2149,12 +2167,14 @@ mod tests {
             "en-US",
             &settings,
             metadata,
+            &cache,
+            date_label,
         )
         .unwrap_err();
         assert!(matches!(err, WallpaperError::DownloadStatus { .. }));
         assert!(!target.exists());
 
-        let temps: Vec<_> = fs::read_dir(tmpdir.path())
+        let temps: Vec<_> = fs::read_dir(target_dir)
             .unwrap()
             .filter_map(|entry| entry.ok())
             .map(|entry| entry.path())
@@ -2469,6 +2489,9 @@ mod tests {
     #[test]
     fn ensure_info_file_restores_missing_info() {
         let tmpdir = tempdir().unwrap();
+        let cache = CacheManager::new(tmpdir.path());
+        let date_label = "2024-01-02";
+        let media_dir = cache.media_dir(date_label, WallpaperSource::Bing);
         let candidate = WallpaperCandidate {
             id: "bing-2024-01-02-uhd".into(),
             source: WallpaperSource::Bing,
@@ -2477,14 +2500,14 @@ mod tests {
             attribution: None,
             info_url: None,
             image_url: "http://example".into(),
-            local_path: tmpdir.path().join("wallpaper2.jpg"),
-            date: "2024-01-02".into(),
+            local_path: media_dir.join("wallpaper2.jpg"),
+            date: date_label.into(),
             metadata_xml: Some("<xml>info</xml>".into()),
         };
 
-        let info_path = tmpdir.path().join("info.xml");
+        let info_path = media_dir.join("info.xml");
         assert!(!info_path.exists());
-        ensure_info_file(tmpdir.path(), &candidate).unwrap();
+        ensure_info_file(&candidate).unwrap();
         assert!(info_path.exists());
         let contents = fs::read_to_string(info_path).unwrap();
         assert!(contents.contains("info"));

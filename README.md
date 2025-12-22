@@ -65,7 +65,7 @@ daily-wallpaper
   daily-wallpaper choose
   ```
 
-Wallpapers and `info.xml` land in `~/Pictures/daily-wallpapers/` unless you override with `--picturedir`.
+Wallpapers and metadata are stored under `~/Pictures/daily-wallpapers/cache/<date>/` unless you override with `--picturedir`.
 
 ## Automatic updates (`launchd`)
 

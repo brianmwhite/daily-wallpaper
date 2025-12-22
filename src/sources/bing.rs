@@ -186,7 +186,7 @@ pub(crate) fn fetch_bing_candidate(
                     ),
                     settings,
                 );
-                ensure_info_file(&settings.picture_dir, &candidate)?;
+                ensure_info_file(&candidate)?;
                 return Ok(FetchedCandidate {
                     candidate,
                     skipped_download: true,
@@ -207,7 +207,7 @@ pub(crate) fn fetch_bing_candidate(
                         ),
                         settings,
                     );
-                    ensure_info_file(&settings.picture_dir, &candidate)?;
+                    ensure_info_file(&candidate)?;
                     return Ok(FetchedCandidate {
                         candidate,
                         skipped_download: true,
@@ -253,6 +253,8 @@ pub(crate) fn fetch_bing_candidate(
             country,
             settings,
             &metadata_body,
+            cache,
+            date_label,
         ) {
             Ok(downloaded) => {
                 let candidate_date =
@@ -278,8 +280,15 @@ pub(crate) fn fetch_bing_candidate(
                 });
             }
             Err(err) => {
-                log(&format!("Resolution {res} failed: {err}"), settings.quiet);
-                last_error = Some(err);
+                if let WallpaperError::DownloadStatus { status: 404, .. } = err {
+                    log_verbose(
+                        &format!("Resolution {res} not available; skipping."),
+                        settings,
+                    );
+                } else {
+                    log(&format!("Resolution {res} failed: {err}"), settings.quiet);
+                    last_error = Some(err);
+                }
             }
         }
     }
@@ -427,6 +436,8 @@ pub(crate) fn download_image(
     country: &str,
     settings: &Settings,
     metadata_body: &[u8],
+    cache: &CacheManager,
+    date_label: &str,
 ) -> Result<DownloadedImage> {
     let file_url_with_res = format!("{url_base}_{resolution}.jpg");
     let file_url = format!(
@@ -451,7 +462,8 @@ pub(crate) fn download_image(
         settings.auto_update_name.clone()
     };
     let filename_local = format!("{cleanup_prefix}-{filename_local}");
-    let target_path = settings.picture_dir.join(filename_local);
+    let target_dir = cache.media_dir(date_label, WallpaperSource::Bing);
+    let target_path = target_dir.join(filename_local);
 
     if target_path.exists() && !settings.force {
         let name = target_path
@@ -481,6 +493,7 @@ pub(crate) fn download_image(
     let temp_path = crate::unique_temp_path(&target_path);
     let download_result = (|| -> Result<()> {
         let _ = fs::remove_file(&temp_path);
+        fs::create_dir_all(&target_dir)?;
 
         let mut response = client
             .get(&file_url)
@@ -509,7 +522,7 @@ pub(crate) fn download_image(
         file.flush()?;
         file.sync_all()?;
 
-        for entry in fs::read_dir(&settings.picture_dir)? {
+        for entry in fs::read_dir(&target_dir)? {
             let entry = entry?;
             let path = entry.path();
             if path == target_path {
@@ -525,7 +538,7 @@ pub(crate) fn download_image(
         }
 
         fs::rename(&temp_path, &target_path)?;
-        write_bytes_atomic(&settings.picture_dir.join("info.xml"), metadata_body)?;
+        write_bytes_atomic(&target_dir.join("info.xml"), metadata_body)?;
         Ok(())
     })();
 
