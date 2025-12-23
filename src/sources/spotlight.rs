@@ -172,6 +172,21 @@ pub(crate) fn fetch_spotlight_candidates(
     date_label: &str,
     spotlight_settings: &SpotlightSettings,
 ) -> Result<Vec<WallpaperCandidate>> {
+    if !settings.force {
+        if let Some(skip) = cache.read_skip(date_label, WallpaperSource::Spotlight)? {
+            log_verbose(
+                &format!(
+                    "Skipping Spotlight for {} ({}).",
+                    date_label, skip.reason
+                ),
+                settings,
+            );
+            return Err(WallpaperError::Message(format!(
+                "Spotlight skipped for {}.",
+                date_label
+            )));
+        }
+    }
     let cached_candidates = if let Some(index) = cache.load_index(date_label)? {
         index
             .candidates
@@ -216,7 +231,16 @@ pub(crate) fn fetch_spotlight_candidates(
         let file_name = format!("spotlight_{date_label}_{ordinal}.jpg");
         let local_path = media_dir.join(file_name);
 
-        let download = download_to_path(client, &asset_url, &local_path, settings)?;
+        let download = match download_to_path(client, &asset_url, &local_path, settings) {
+            Ok(download) => download,
+            Err(err) => {
+                if matches!(err, WallpaperError::MinResolution { .. }) {
+                    let _ =
+                        cache.write_skip(date_label, WallpaperSource::Spotlight, "min_resolution");
+                }
+                return Err(err);
+            }
+        };
 
         let candidate_id = format!("spotlight-{date_label}-{ordinal}");
         let candidate = WallpaperCandidate {

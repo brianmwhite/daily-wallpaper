@@ -131,6 +131,12 @@ favorites_dir = "~/Pictures/daily-wallpapers/favorites"
 # Minimum resolution for downloaded wallpapers (WIDTHxHEIGHT)
 min_resolution = "1920x1080"
 
+# Optional log file path (append mode)
+log_file = "~/Library/Logs/daily-wallpaper.log"
+
+# Log file size limit in KB before rotating (default 5120 = 5MB)
+log_file_max_kb = 5120
+
 # Verbosity: quiet | normal | verbose
 verbosity = "normal"
 

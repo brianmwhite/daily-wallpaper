@@ -121,6 +121,21 @@ pub(crate) fn fetch_apod_candidate(
     date_label: &str,
     apod_settings: &ApodSettings,
 ) -> Result<WallpaperCandidate> {
+    if !settings.force {
+        if let Some(skip) = cache.read_skip(date_label, WallpaperSource::Apod)? {
+            log_verbose(
+                &format!(
+                    "Skipping APOD for {} ({}).",
+                    date_label, skip.reason
+                ),
+                settings,
+            );
+            return Err(WallpaperError::Message(format!(
+                "APOD skipped for {}.",
+                date_label
+            )));
+        }
+    }
     fetch_apod_candidate_with_fallback(
         client,
         cache,
@@ -203,7 +218,19 @@ fn fetch_apod_candidate_with_fallback(
     fs::create_dir_all(&media_dir)?;
     let file_name = format!("apod_{requested_date_label}.jpg");
     let target_path = media_dir.join(file_name);
-    let download = download_to_path(client, &image_url, &target_path, settings)?;
+    let download = match download_to_path(client, &image_url, &target_path, settings) {
+        Ok(download) => download,
+        Err(err) => {
+            if matches!(err, WallpaperError::MinResolution { .. }) {
+                let _ = cache.write_skip(
+                    requested_date_label,
+                    WallpaperSource::Apod,
+                    "min_resolution",
+                );
+            }
+            return Err(err);
+        }
+    };
 
     let candidate = WallpaperCandidate {
         id: candidate_id,
@@ -223,7 +250,9 @@ fn fetch_apod_candidate_with_fallback(
         settings,
     );
     if apod_settings.crop {
-        let spinner = start_spinner(settings, "Processing APOD image…");
+        let message = "Processing APOD image…";
+        crate::log_action_start(settings, message);
+        let spinner = start_spinner(settings, message);
         match crop_and_resize_apod(&candidate.local_path) {
             Ok(()) => finish_spinner(spinner, "Processed APOD image", settings, false),
             Err(err) => {
@@ -430,6 +459,8 @@ mod tests {
             info_plain_text: false,
             refresh_metadata: true,
             min_resolution: None,
+            log_file: None,
+            log_file_max_bytes: 5120 * 1024,
         }
     }
 

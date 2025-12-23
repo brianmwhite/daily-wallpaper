@@ -97,6 +97,21 @@ impl Source for BingSource {
     }
 
     fn fetch(&self, ctx: &SourceContext<'_>) -> Result<FetchResult> {
+        if !ctx.settings.force {
+            if let Some(skip) = ctx.cache.read_skip(ctx.date_label, WallpaperSource::Bing)? {
+                log_verbose(
+                    &format!(
+                        "Skipping Bing for {} ({}).",
+                        ctx.date_label, skip.reason
+                    ),
+                    ctx.settings,
+                );
+                return Err(WallpaperError::Message(format!(
+                    "Bing skipped for {}.",
+                    ctx.date_label
+                )));
+            }
+        }
         let resolutions = if ctx.source_settings.bing.resolutions.is_empty() {
             DEFAULT_RESOLUTIONS.iter().map(|s| s.to_string()).collect()
         } else {
@@ -268,19 +283,19 @@ pub(crate) fn fetch_bing_candidate(
     let metadata_date = metadata_date_label(&metadata_body).ok().and_then(|date| date);
 
     let mut last_error: Option<WallpaperError> = None;
-    for res in resolutions {
-        match download_image(
-            client,
-            &url_base,
-            &res,
+        for res in resolutions {
+            match download_image(
+                client,
+                &url_base,
+                &res,
             bing_settings,
             country,
             settings,
             &metadata_body,
-            cache,
-            date_label,
-        ) {
-            Ok(downloaded) => {
+                cache,
+                date_label,
+            ) {
+                Ok(downloaded) => {
                 let candidate_date =
                     metadata_date.clone().unwrap_or_else(|| date_label.to_string());
                 let candidate = WallpaperCandidate {
@@ -303,12 +318,16 @@ pub(crate) fn fetch_bing_candidate(
                     candidate,
                     skipped_download: downloaded.skipped,
                 });
-            }
-            Err(err) => {
-                if let WallpaperError::DownloadStatus { status: 404, .. } = err {
-                    log_verbose(
-                        &format!("Resolution {res} not available; skipping."),
-                        settings,
+                }
+                Err(err) => {
+                    if matches!(err, WallpaperError::MinResolution { .. }) {
+                        let _ = cache.write_skip(date_label, WallpaperSource::Bing, "min_resolution");
+                        return Err(err);
+                    }
+                    if let WallpaperError::DownloadStatus { status: 404, .. } = err {
+                        log_verbose(
+                            &format!("Resolution {res} not available; skipping."),
+                            settings,
                     );
                 } else {
                     log(&format!("Resolution {res} failed: {err}"), settings.quiet);
@@ -651,10 +670,9 @@ pub(crate) fn download_image(
         &format!("Downloading {resolution} from {file_url}"),
         settings,
     );
-    let spinner = start_spinner(
-        settings,
-        format!("Downloading Bing {resolution} wallpaper…"),
-    );
+    let message = format!("Downloading Bing {resolution} wallpaper…");
+    crate::log_action_start(settings, &message);
+    let spinner = start_spinner(settings, message);
 
     let temp_path = crate::unique_temp_path(&target_path);
     let download_result = (|| -> Result<()> {

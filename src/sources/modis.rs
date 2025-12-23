@@ -82,6 +82,21 @@ pub(crate) fn fetch_modis_candidate(
     date_label: &str,
     modis_settings: &ModisSettings,
 ) -> Result<WallpaperCandidate> {
+    if !settings.force {
+        if let Some(skip) = cache.read_skip(date_label, WallpaperSource::Modis)? {
+            log_verbose(
+                &format!(
+                    "Skipping MODIS for {} ({}).",
+                    date_label, skip.reason
+                ),
+                settings,
+            );
+            return Err(WallpaperError::Message(format!(
+                "MODIS skipped for {}.",
+                date_label
+            )));
+        }
+    }
     if let Some(candidate) = cache.find_candidate(date_label, WallpaperSource::Modis)? {
         if candidate.local_path.exists() && (!settings.force || settings.offline) {
             log_verbose(
@@ -109,7 +124,15 @@ pub(crate) fn fetch_modis_candidate(
     fs::create_dir_all(&media_dir)?;
     let file_name = format!("modis_{date_label}.jpg");
     let target_path = media_dir.join(file_name);
-    let download = download_to_path(client, &parsed.image_url, &target_path, settings)?;
+    let download = match download_to_path(client, &parsed.image_url, &target_path, settings) {
+        Ok(download) => download,
+        Err(err) => {
+            if matches!(err, WallpaperError::MinResolution { .. }) {
+                let _ = cache.write_skip(date_label, WallpaperSource::Modis, "min_resolution");
+            }
+            return Err(err);
+        }
+    };
 
     let attribution = parsed
         .credit

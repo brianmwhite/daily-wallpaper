@@ -14,6 +14,7 @@ use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::collections::HashSet;
 #[cfg(target_os = "macos")]
@@ -131,6 +132,13 @@ pub enum WallpaperError {
         #[source]
         source: reqwest::Error,
     },
+    #[error("Downloaded image {width}x{height} below minimum {min_width}x{min_height}")]
+    MinResolution {
+        width: u32,
+        height: u32,
+        min_width: u32,
+        min_height: u32,
+    },
     #[error("Could not parse Bing metadata response.")]
     MetadataParse,
     #[error("Bing response did not include an image URL.")]
@@ -172,6 +180,8 @@ struct Settings {
     info_plain_text: bool,
     refresh_metadata: bool,
     min_resolution: Option<(u32, u32)>,
+    log_file: Option<PathBuf>,
+    log_file_max_bytes: u64,
 }
 
 impl Settings {
@@ -217,6 +227,12 @@ struct CacheIndex {
     candidates: Vec<WallpaperCandidate>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SourceSkip {
+    reason: String,
+    created_at: u64,
+}
+
 #[derive(Debug, Default, Deserialize, Clone)]
 struct AppConfig {
     #[serde(default)]
@@ -245,6 +261,10 @@ struct AppConfig {
     info_plain_text: Option<bool>,
     #[serde(default)]
     min_resolution: Option<String>,
+    #[serde(default)]
+    log_file: Option<PathBuf>,
+    #[serde(default)]
+    log_file_max_kb: Option<u64>,
     #[serde(default)]
     apod_api_key: Option<String>,
     #[serde(default)]
@@ -295,6 +315,10 @@ impl CacheManager {
         self.base_dir.join(date).join(source_dir_name(source))
     }
 
+    fn skip_path(&self, date: &str, source: WallpaperSource) -> PathBuf {
+        self.media_dir(date, source).join("skip.json")
+    }
+
     fn load_index(&self, date: &str) -> Result<Option<CacheIndex>> {
         let path = self.index_path(date);
         if !path.exists() {
@@ -328,6 +352,33 @@ impl CacheManager {
             fs::create_dir_all(parent)?;
         }
         let bytes = serde_json::to_vec_pretty(index)?;
+        write_bytes_atomic(&path, &bytes)?;
+        Ok(())
+    }
+
+    fn read_skip(&self, date: &str, source: WallpaperSource) -> Result<Option<SourceSkip>> {
+        let path = self.skip_path(date, source);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let data = fs::read(&path)?;
+        let skip = serde_json::from_slice::<SourceSkip>(&data)?;
+        Ok(Some(skip))
+    }
+
+    fn write_skip(&self, date: &str, source: WallpaperSource, reason: &str) -> Result<()> {
+        let path = self.skip_path(date, source);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let skip = SourceSkip {
+            reason: reason.to_string(),
+            created_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        };
+        let bytes = serde_json::to_vec_pretty(&skip)?;
         write_bytes_atomic(&path, &bytes)?;
         Ok(())
     }
@@ -527,6 +578,15 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
         .as_ref()
         .and_then(|cfg| cfg.min_resolution.as_deref())
         .and_then(parse_resolution);
+    let log_file = config
+        .as_ref()
+        .and_then(|cfg| cfg.log_file.clone())
+        .map(|path| path.expand_tilde());
+    let log_file_max_bytes = config
+        .as_ref()
+        .and_then(|cfg| cfg.log_file_max_kb)
+        .unwrap_or(5120)
+        .saturating_mul(1024);
 
     let mut quiet = args.quiet;
     let mut verbose = args.verbose;
@@ -629,7 +689,10 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
         info_plain_text,
         refresh_metadata: true,
         min_resolution,
+        log_file,
+        log_file_max_bytes,
     };
+    set_log_file(settings.log_file.clone(), settings.log_file_max_bytes);
 
     if settings.offline && settings.force {
         log(
@@ -810,11 +873,13 @@ fn parse_resolution(value: &str) -> Option<(u32, u32)> {
 }
 
 fn log(message: &str, quiet: bool) {
+    let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
+    let line = format!("{timestamp}: {message}");
+    write_log_line(&line);
     if quiet {
         return;
     }
-    let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
-    println!("{timestamp}: {message}");
+    println!("{line}");
 }
 
 fn log_verbose(message: &str, settings: &Settings) {
@@ -822,6 +887,65 @@ fn log_verbose(message: &str, settings: &Settings) {
         return;
     }
     log(message, false);
+}
+
+pub(crate) fn log_action_start(settings: &Settings, message: &str) {
+    let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
+    let line = format!("{timestamp}: {message}");
+    write_log_line(&line);
+    if settings.quiet || !settings.verbose {
+        return;
+    }
+    println!("{line}");
+}
+
+#[derive(Clone)]
+struct LogConfig {
+    path: PathBuf,
+    max_bytes: u64,
+}
+
+fn log_file_storage() -> &'static Mutex<Option<LogConfig>> {
+    static LOG_FILE: OnceLock<Mutex<Option<LogConfig>>> = OnceLock::new();
+    LOG_FILE.get_or_init(|| Mutex::new(None))
+}
+
+fn set_log_file(path: Option<PathBuf>, max_bytes: u64) {
+    let mut guard = log_file_storage().lock().unwrap();
+    *guard = path.map(|path| LogConfig { path, max_bytes });
+}
+
+fn write_log_line(line: &str) {
+    let config = {
+        let guard = log_file_storage().lock().unwrap();
+        guard.clone()
+    };
+    let Some(config) = config else {
+        return;
+    };
+    if let Some(parent) = config.path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    rotate_log_file(&config);
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&config.path)
+    {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
+fn rotate_log_file(config: &LogConfig) {
+    let Ok(metadata) = fs::metadata(&config.path) else {
+        return;
+    };
+    if metadata.len() < config.max_bytes {
+        return;
+    }
+    let rotated = PathBuf::from(format!("{}.1", config.path.display()));
+    let _ = fs::remove_file(&rotated);
+    let _ = fs::rename(&config.path, rotated);
 }
 
 fn start_spinner(
@@ -1294,10 +1418,14 @@ fn gather_candidates(
         };
         match source.fetch(&ctx) {
             Ok(fetched) => result.extend(fetched.candidates),
-            Err(err) => log(
-                &format!("{} unavailable: {err}", source.label()),
-                settings.quiet,
-            ),
+            Err(err) => {
+                let msg = format!("{} unavailable: {err}", source.label());
+                if settings.verbose || !msg.contains("skipped for") {
+                    log(&msg, settings.quiet);
+                } else {
+                    log_verbose(&msg, settings);
+                }
+            }
         }
     }
 
@@ -1337,8 +1465,9 @@ fn download_to_path(
         fs::create_dir_all(parent)?;
     }
 
-    log_verbose(&format!("Downloading {}", url), settings);
-    let spinner = start_spinner(settings, format!("Downloading {}", url));
+    let message = format!("Downloading {}", url);
+    log_action_start(settings, &message);
+    let spinner = start_spinner(settings, message);
     let temp_path = unique_temp_path(target_path);
     let download_result = (|| -> Result<()> {
         let _ = fs::remove_file(&temp_path);
@@ -1404,11 +1533,13 @@ pub(crate) fn enforce_min_resolution(path: &Path, settings: &Settings) -> Result
             ),
             settings,
         );
-        return Err(WallpaperError::Message(format!(
-            "Downloaded image {}x{} below minimum {}x{}.",
-            width, height, min_width, min_height
-        )));
-    }
+            return Err(WallpaperError::MinResolution {
+                width,
+                height,
+                min_width,
+                min_height,
+            });
+        }
 
     Ok(())
 }
@@ -2106,6 +2237,8 @@ mod tests {
             info_plain_text: false,
             refresh_metadata: true,
             min_resolution: None,
+            log_file: None,
+            log_file_max_bytes: 5120 * 1024,
         }
     }
 
