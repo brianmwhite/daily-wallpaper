@@ -1,4 +1,4 @@
-use chrono::{Duration as ChronoDuration, Local, NaiveDate};
+use chrono::{Duration as ChronoDuration, Local, NaiveDate, TimeZone};
 use clap::{ArgAction, Parser, ValueEnum};
 use inquire::{InquireError, Select, Text};
 use plist::{Dictionary, Value};
@@ -758,6 +758,15 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
     if !settings.force {
         if let Some(last) = cache.read_last_applied()? {
             let today = Local::now().date_naive().to_string();
+            if let Some(applied_at) = Local.timestamp_opt(last.applied_at as i64, 0).single() {
+                if applied_at.date_naive().to_string() == today {
+                    log(
+                        "Wallpaper already set today; skipping auto update.",
+                        settings.quiet,
+                    );
+                    return Ok(());
+                }
+            }
             let mut last_date = last.date.clone();
             if last.source == WallpaperSource::Bing {
                 let cached_candidate = last
