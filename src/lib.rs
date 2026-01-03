@@ -233,6 +233,11 @@ struct SourceSkip {
     created_at: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct InProgressFetch {
+    started_at: u64,
+}
+
 #[derive(Debug, Default, Deserialize, Clone)]
 struct AppConfig {
     #[serde(default)]
@@ -319,6 +324,10 @@ impl CacheManager {
         self.media_dir(date, source).join("skip.json")
     }
 
+    fn in_progress_path(&self, date: &str, source: WallpaperSource) -> PathBuf {
+        self.media_dir(date, source).join("in_progress.json")
+    }
+
     fn load_index(&self, date: &str) -> Result<Option<CacheIndex>> {
         let path = self.index_path(date);
         if !path.exists() {
@@ -381,6 +390,41 @@ impl CacheManager {
         let bytes = serde_json::to_vec_pretty(&skip)?;
         write_bytes_atomic(&path, &bytes)?;
         Ok(())
+    }
+
+    fn read_in_progress(
+        &self,
+        date: &str,
+        source: WallpaperSource,
+    ) -> Result<Option<InProgressFetch>> {
+        let path = self.in_progress_path(date, source);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let data = fs::read(&path)?;
+        let progress = serde_json::from_slice::<InProgressFetch>(&data)?;
+        Ok(Some(progress))
+    }
+
+    fn write_in_progress(&self, date: &str, source: WallpaperSource) -> Result<()> {
+        let path = self.in_progress_path(date, source);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let progress = InProgressFetch {
+            started_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        };
+        let bytes = serde_json::to_vec_pretty(&progress)?;
+        write_bytes_atomic(&path, &bytes)?;
+        Ok(())
+    }
+
+    fn clear_in_progress(&self, date: &str, source: WallpaperSource) {
+        let path = self.in_progress_path(date, source);
+        let _ = fs::remove_file(&path);
     }
 
     fn find_candidate(
@@ -1415,9 +1459,40 @@ fn gather_candidates(
     source_settings: &SourceSettings,
 ) -> Result<Vec<WallpaperCandidate>> {
     let mut result = Vec::new();
+    let mut skipped_summaries: Vec<String> = Vec::new();
+
+    let skip_reason_for_error = |err: &WallpaperError| -> Option<String> {
+        match err {
+            WallpaperError::Request(req_err) => {
+                if req_err.is_timeout() {
+                    Some("request_timeout".to_string())
+                } else {
+                    Some("request_error".to_string())
+                }
+            }
+            WallpaperError::Status { status, .. } => Some(format!("status_{status}")),
+            WallpaperError::DownloadStatus { status, .. } => Some(format!("download_status_{status}")),
+            WallpaperError::Download { .. } => Some("download_error".to_string()),
+            _ => None,
+        }
+    };
 
     for source in registry.all() {
         let date_label = date_label_for(Some(source), settings, source_settings);
+        if !settings.force {
+            if cache
+                .read_in_progress(&date_label, source.id())?
+                .is_some()
+            {
+                let _ = cache.write_skip(&date_label, source.id(), "interrupted");
+                cache.clear_in_progress(&date_label, source.id());
+                let mut summary =
+                    format!("{} skipped (interrupted).", source.label());
+                summary.push_str(" Use --force to retry.");
+                skipped_summaries.push(summary);
+                continue;
+            }
+        }
         let ctx = SourceContext {
             client,
             cache,
@@ -1425,9 +1500,45 @@ fn gather_candidates(
             date_label: &date_label,
             source_settings,
         };
+        let _ = cache.write_in_progress(&date_label, source.id());
+        let spinner = start_spinner(
+            settings,
+            format!("Fetching {} (Ctrl+C to cancel)…", source.label()),
+        );
         match source.fetch(&ctx) {
-            Ok(fetched) => result.extend(fetched.candidates),
+            Ok(fetched) => {
+                cache.clear_in_progress(&date_label, source.id());
+                finish_spinner(
+                    spinner,
+                    &format!("Fetched {}", source.label()),
+                    settings,
+                    false,
+                );
+                result.extend(fetched.candidates);
+            }
             Err(err) => {
+                cache.clear_in_progress(&date_label, source.id());
+                finish_spinner(spinner, "", settings, true);
+                let mut skip_reason: Option<String> = None;
+                if !settings.force {
+                    if let Ok(Some(skip)) = cache.read_skip(&date_label, source.id()) {
+                        skip_reason = Some(skip.reason);
+                    }
+                }
+                if skip_reason.is_none() && !settings.force && !settings.offline {
+                    if let Some(reason) = skip_reason_for_error(&err) {
+                        let _ = cache.write_skip(&date_label, source.id(), &reason);
+                        skip_reason = Some(reason);
+                    }
+                }
+                if let Some(reason) = skip_reason {
+                    let mut summary =
+                        format!("{} skipped ({reason}).", source.label());
+                    if !settings.force {
+                        summary.push_str(" Use --force to retry.");
+                    }
+                    skipped_summaries.push(summary);
+                }
                 let msg = format!("{} unavailable: {err}", source.label());
                 if settings.verbose || !msg.contains("skipped for") {
                     log(&msg, settings.quiet);
@@ -1435,6 +1546,12 @@ fn gather_candidates(
                     log_verbose(&msg, settings);
                 }
             }
+        }
+    }
+
+    if !skipped_summaries.is_empty() && !settings.quiet {
+        for summary in skipped_summaries {
+            log(&summary, settings.quiet);
         }
     }
 
