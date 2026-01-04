@@ -186,7 +186,7 @@ All chooser/apply/cache logic is source-agnostic; new sources should not require
   enable-display-sync            Write and load a launchd plist that reapplies wallpaper on display changes.
   disable-display-sync           Unload and remove the display sync launchd plist.
   info                           Print the headline and copyright of the last download.
-  choose                         Interactive picker (arrows/Enter) for Bing + Spotlight (3) + APOD; preview via Quick Look.
+  choose                         Interactive picker (arrows/Enter) for Bing + Spotlight (3) + APOD; Ctrl-C cancels remaining downloads.
                                  Also includes a Favorites list for saved wallpapers.
 
   --prune-cache-days <n>         After a successful run, delete cached days older than <n> days.
@@ -213,6 +213,7 @@ All chooser/apply/cache logic is source-agnostic; new sources should not require
 - For local development without installing, run `./run.sh ...` (calls `cargo run --`).
 - APOD skips non-image media, defaults to the NASA DEMO_KEY (supply your own key or set `NASA_API_KEY` or `[apod].api_key` to avoid rate limits), and center-crops/resizes to your primary display’s aspect ratio by default (toggle with `[apod].crop` in config).
 - `choose` downloads/caches today’s Bing, Spotlight, and APOD candidates (if available), lets you navigate with arrows, preview via Quick Look, refresh, or apply.
+- During `choose` downloads, Ctrl-C cancels remaining sources and returns partial results; Ctrl-C in menus exits the chooser.
 - Use `--prune-cache-days <n>` to delete cached days older than `<n>` after a successful run.
 - Use `--offline` or `offline = true` in `~/.wallpaperconfig` to reuse cached wallpapers and avoid all network calls.
 - Favorites: inside the `choose` flow, you can mark a candidate as a favorite (copies image + per-file metadata into `favorites_dir`) and browse/apply/remove favorites via the `Favorites` option. Favorites are offline-friendly and not pruned.

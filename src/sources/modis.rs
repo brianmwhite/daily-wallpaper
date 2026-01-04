@@ -1,6 +1,7 @@
 use crate::{
-    download_to_path, ensure_http_success, log_verbose, CacheManager, Result, Settings,
-    WallpaperCandidate, WallpaperError, WallpaperSource, METADATA_TIMEOUT,
+    download_to_path, ensure_http_success, log_verbose, read_response_bytes_with_cancel,
+    CacheManager, Result, Settings, WallpaperCandidate, WallpaperError, WallpaperSource,
+    METADATA_TIMEOUT,
 };
 use reqwest::blocking::Client;
 use scraper::{Html, Selector};
@@ -53,6 +54,7 @@ impl Source for ModisSource {
             ctx.settings,
             ctx.date_label,
             &ctx.source_settings.modis,
+            ctx.cancel,
         )?;
         Ok(FetchResult::single(candidate, false))
     }
@@ -81,6 +83,7 @@ pub(crate) fn fetch_modis_candidate(
     settings: &Settings,
     date_label: &str,
     modis_settings: &ModisSettings,
+    cancel: Option<&crate::CancelFlag>,
 ) -> Result<WallpaperCandidate> {
     if !settings.force {
         if let Some(skip) = cache.read_skip(date_label, WallpaperSource::Modis)? {
@@ -117,14 +120,18 @@ pub(crate) fn fetch_modis_candidate(
     log_verbose(&format!("Fetching MODIS page: {page_url}"), settings);
     let response = client.get(&page_url).timeout(METADATA_TIMEOUT).send()?;
     ensure_http_success(response.status(), &page_url)?;
-    let body = response.text()?;
+    let body = read_response_bytes_with_cancel(response, cancel)?;
+    let body = String::from_utf8(body).map_err(|_| {
+        WallpaperError::Message("MODIS response is not valid UTF-8.".to_string())
+    })?;
 
     let parsed = parse_modis_html(&body)?;
     let media_dir = cache.media_dir(date_label, WallpaperSource::Modis);
     fs::create_dir_all(&media_dir)?;
     let file_name = format!("modis_{date_label}.jpg");
     let target_path = media_dir.join(file_name);
-    let download = match download_to_path(client, &parsed.image_url, &target_path, settings) {
+    let download =
+        match download_to_path(client, &parsed.image_url, &target_path, settings, cancel) {
         Ok(download) => download,
         Err(err) => {
             if matches!(err, WallpaperError::MinResolution { .. }) {

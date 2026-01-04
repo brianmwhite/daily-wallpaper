@@ -1,7 +1,8 @@
 use crate::{
-    ensure_http_success, ensure_info_file, finish_spinner, log, log_verbose, start_spinner,
-    write_bytes_atomic, CacheManager, Result, Settings, WallpaperCandidate, WallpaperError,
-    WallpaperSource, DEFAULT_RESOLUTIONS, IMAGE_TIMEOUT, METADATA_TIMEOUT,
+    ensure_http_success, ensure_info_file, finish_spinner, log, log_verbose,
+    read_response_bytes_with_cancel, start_spinner, write_bytes_atomic, CacheManager, Result,
+    Settings, WallpaperCandidate, WallpaperError, WallpaperSource, DEFAULT_RESOLUTIONS,
+    IMAGE_TIMEOUT, METADATA_TIMEOUT,
 };
 use reqwest::blocking::Client;
 use sha2::{Digest, Sha256};
@@ -138,6 +139,7 @@ impl Source for BingSource {
                 &ctx.source_settings.bing,
                 &country,
                 resolutions.clone(),
+                ctx.cancel,
             ) {
                 Ok(fetched) => {
                     if !fetched.skipped_download {
@@ -192,6 +194,7 @@ pub(crate) fn fetch_bing_candidate(
     bing_settings: &BingSettings,
     country: &str,
     resolutions: Vec<String>,
+    cancel: Option<&crate::CancelFlag>,
 ) -> Result<FetchedCandidate> {
     if let Some(mut candidate) =
         find_cached_candidate_for_country(cache, date_label, country, &resolutions)?
@@ -278,23 +281,24 @@ pub(crate) fn fetch_bing_candidate(
         &format!("Fetching Bing metadata ({country}): {}", archive_url),
         settings,
     );
-    let (url_base, metadata_body) = fetch_image_metadata(client, &archive_url)?;
+    let (url_base, metadata_body) = fetch_image_metadata(client, &archive_url, cancel)?;
     let metadata = parse_bing_metadata(&metadata_body)?;
     let metadata_date = metadata_date_label(&metadata_body).ok().and_then(|date| date);
 
     let mut last_error: Option<WallpaperError> = None;
-        for res in resolutions {
-            match download_image(
-                client,
-                &url_base,
-                &res,
+    for res in resolutions {
+        match download_image(
+            client,
+            &url_base,
+            &res,
             bing_settings,
             country,
             settings,
             &metadata_body,
-                cache,
-                date_label,
-            ) {
+            cache,
+            date_label,
+            cancel,
+        ) {
                 Ok(downloaded) => {
                 let candidate_date =
                     metadata_date.clone().unwrap_or_else(|| date_label.to_string());
@@ -523,11 +527,14 @@ pub(crate) fn build_archive_url(day: i32, country: Option<&str>) -> String {
     format!("{BING_ARCHIVE_URL}?{}", serializer.finish())
 }
 
-fn fetch_image_metadata(client: &Client, archive_url: &str) -> Result<(String, Vec<u8>)> {
+fn fetch_image_metadata(
+    client: &Client,
+    archive_url: &str,
+    cancel: Option<&crate::CancelFlag>,
+) -> Result<(String, Vec<u8>)> {
     let response = client.get(archive_url).timeout(METADATA_TIMEOUT).send()?;
     ensure_http_success(response.status(), archive_url)?;
-
-    let body = response.bytes()?.to_vec();
+    let body = read_response_bytes_with_cancel(response, cancel)?;
     let url_base = parse_xml_text(&body, "urlBase")?.ok_or(WallpaperError::MissingImageUrl)?;
     Ok((url_base, body))
 }
@@ -621,6 +628,7 @@ pub(crate) fn download_image(
     metadata_body: &[u8],
     cache: &CacheManager,
     date_label: &str,
+    cancel: Option<&crate::CancelFlag>,
 ) -> Result<DownloadedImage> {
     let file_url_with_res = format!("{url_base}_{resolution}.jpg");
     let file_url = format!(
@@ -697,12 +705,17 @@ pub(crate) fn download_image(
         }
 
         let mut file = File::create(&temp_path)?;
-        response
-            .copy_to(&mut file)
-            .map_err(|err| WallpaperError::Download {
-                resolution: resolution.to_string(),
-                source: err,
-            })?;
+        let mut buf = [0u8; 32 * 1024];
+        loop {
+            if cancel.is_some_and(|flag| flag.is_set()) {
+                return Err(WallpaperError::Canceled);
+            }
+            let bytes_read = response.read(&mut buf)?;
+            if bytes_read == 0 {
+                break;
+            }
+            file.write_all(&buf[..bytes_read])?;
+        }
         file.flush()?;
         file.sync_all()?;
 

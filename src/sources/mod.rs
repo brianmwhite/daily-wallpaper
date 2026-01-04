@@ -3,8 +3,9 @@ pub mod bing;
 pub mod modis;
 pub mod spotlight;
 
-use crate::{CacheManager, Result, Settings, WallpaperCandidate, WallpaperSource};
+use crate::{CacheManager, CancelFlag, Result, Settings, WallpaperCandidate, WallpaperSource};
 use reqwest::blocking::Client;
+use std::sync::Arc;
 
 pub struct SourceContext<'a> {
     pub client: &'a Client,
@@ -12,6 +13,7 @@ pub struct SourceContext<'a> {
     pub settings: &'a Settings,
     pub date_label: &'a str,
     pub source_settings: &'a SourceSettings,
+    pub cancel: Option<&'a CancelFlag>,
 }
 
 #[derive(Debug)]
@@ -51,7 +53,7 @@ pub trait Source: Send + Sync {
 }
 
 pub struct SourceRegistry {
-    sources: Vec<Box<dyn Source>>,
+    sources: Vec<Arc<dyn Source>>,
 }
 
 impl Default for SourceRegistry {
@@ -64,10 +66,10 @@ impl SourceRegistry {
     pub fn new() -> Self {
         Self {
             sources: vec![
-                Box::new(bing::BingSource),
-                Box::new(spotlight::SpotlightSource),
-                Box::new(apod::ApodSource),
-                Box::new(modis::ModisSource),
+                Arc::new(bing::BingSource),
+                Arc::new(spotlight::SpotlightSource),
+                Arc::new(apod::ApodSource),
+                Arc::new(modis::ModisSource),
             ],
         }
     }
@@ -79,8 +81,8 @@ impl SourceRegistry {
             .map(|boxed| boxed.as_ref())
     }
 
-    pub fn all(&self) -> impl Iterator<Item = &dyn Source> {
-        self.sources.iter().map(|boxed| boxed.as_ref())
+    pub fn all_cloned(&self) -> Vec<Arc<dyn Source>> {
+        self.sources.clone()
     }
 }
 

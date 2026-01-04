@@ -1,7 +1,7 @@
 use crate::{
     download_to_path, ensure_http_success, finish_spinner, log, log_verbose, start_spinner,
-    unique_temp_path, CacheManager, Result, Settings, WallpaperCandidate, WallpaperError,
-    WallpaperSource, METADATA_TIMEOUT,
+    read_response_bytes_with_cancel, unique_temp_path, CacheManager, Result, Settings,
+    WallpaperCandidate, WallpaperError, WallpaperSource, METADATA_TIMEOUT,
 };
 use image::imageops::FilterType;
 use image::{GenericImageView, ImageFormat};
@@ -83,6 +83,7 @@ impl Source for ApodSource {
             ctx.settings,
             ctx.date_label,
             &ctx.source_settings.apod,
+            ctx.cancel,
         )?;
         Ok(FetchResult::single(candidate, false))
     }
@@ -120,6 +121,7 @@ pub(crate) fn fetch_apod_candidate(
     settings: &Settings,
     date_label: &str,
     apod_settings: &ApodSettings,
+    cancel: Option<&crate::CancelFlag>,
 ) -> Result<WallpaperCandidate> {
     if !settings.force {
         if let Some(skip) = cache.read_skip(date_label, WallpaperSource::Apod)? {
@@ -144,6 +146,7 @@ pub(crate) fn fetch_apod_candidate(
         date_label,
         apod_settings,
         true,
+        cancel,
     )
 }
 
@@ -155,6 +158,7 @@ fn fetch_apod_candidate_with_fallback(
     apod_date_label: &str,
     apod_settings: &ApodSettings,
     allow_fallback: bool,
+    cancel: Option<&crate::CancelFlag>,
 ) -> Result<WallpaperCandidate> {
     let candidate_id = format!("apod-{requested_date_label}");
     if let Some(candidate) = cache.find_candidate_by_id(requested_date_label, &candidate_id)? {
@@ -177,7 +181,7 @@ fn fetch_apod_candidate_with_fallback(
         )));
     }
 
-    let apod = fetch_apod(client, settings, apod_settings, apod_date_label)?;
+    let apod = fetch_apod(client, settings, apod_settings, apod_date_label, cancel)?;
     if apod.media_type != "image" {
         if allow_fallback {
             if let Some(fallback_label) = fallback_date_label(apod_date_label) {
@@ -196,6 +200,7 @@ fn fetch_apod_candidate_with_fallback(
                     &fallback_label,
                     apod_settings,
                     false,
+                    cancel,
                 );
             }
         }
@@ -218,7 +223,7 @@ fn fetch_apod_candidate_with_fallback(
     fs::create_dir_all(&media_dir)?;
     let file_name = format!("apod_{requested_date_label}.jpg");
     let target_path = media_dir.join(file_name);
-    let download = match download_to_path(client, &image_url, &target_path, settings) {
+    let download = match download_to_path(client, &image_url, &target_path, settings, cancel) {
         Ok(download) => download,
         Err(err) => {
             if matches!(err, WallpaperError::MinResolution { .. }) {
@@ -276,6 +281,7 @@ fn fetch_apod(
     settings: &Settings,
     apod_settings: &ApodSettings,
     date_label: &str,
+    cancel: Option<&crate::CancelFlag>,
 ) -> Result<ApodResponse> {
     let mut serializer = url::form_urlencoded::Serializer::new(String::new());
     serializer.append_pair("api_key", &apod_settings.api_key);
@@ -285,7 +291,7 @@ fn fetch_apod(
     log_verbose(&format!("Fetching APOD metadata: {}", url), settings);
     let response = client.get(&url).timeout(METADATA_TIMEOUT).send()?;
     ensure_http_success(response.status(), &url)?;
-    let body = response.bytes()?.to_vec();
+    let body = read_response_bytes_with_cancel(response, cancel)?;
     let parsed: ApodResponse = serde_json::from_slice(&body)?;
     Ok(parsed)
 }
@@ -539,6 +545,7 @@ mod tests {
             &settings,
             date_label,
             &source_settings.apod,
+            None,
         )
         .unwrap();
 
@@ -553,6 +560,7 @@ mod tests {
             &settings,
             date_label,
             &source_settings.apod,
+            None,
         )
         .unwrap();
         assert_eq!(candidate.date, "2023-01-02");
@@ -609,6 +617,7 @@ mod tests {
             &settings,
             date_label,
             &source_settings.apod,
+            None,
         )
         .unwrap_err();
         let msg = format!("{err}");
@@ -622,6 +631,7 @@ mod tests {
             &settings,
             date_label,
             &source_settings.apod,
+            None,
         )
         .unwrap_err();
         let msg = format!("{err}");

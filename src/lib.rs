@@ -11,10 +11,12 @@ use image::image_dimensions;
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::collections::HashSet;
 #[cfg(target_os = "macos")]
@@ -62,7 +64,7 @@ fn source_dir_name(source: WallpaperSource) -> &'static str {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 enum WallpaperSource {
     Bing,
     Spotlight,
@@ -149,6 +151,8 @@ pub enum WallpaperError {
         code: i32,
         stderr: String,
     },
+    #[error("Canceled by user")]
+    Canceled,
     #[error(transparent)]
     Io(#[from] io::Error),
     #[error(transparent)]
@@ -182,6 +186,27 @@ struct Settings {
     min_resolution: Option<(u32, u32)>,
     log_file: Option<PathBuf>,
     log_file_max_bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CancelFlag(Arc<AtomicBool>);
+
+impl CancelFlag {
+    fn new() -> Self {
+        Self(Arc::new(AtomicBool::new(false)))
+    }
+
+    fn set(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    fn clear(&self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+
+    fn is_set(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
 }
 
 impl Settings {
@@ -521,6 +546,10 @@ enum CommandArg {
     DisableDisplaySync,
     DisplaySync,
     Info,
+    #[value(
+        name = "choose",
+        help = "Interactive picker; Ctrl-C during downloads cancels remaining sources."
+    )]
     Choose,
     Reapply,
 }
@@ -849,6 +878,7 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
         settings: &settings,
         date_label: &date_label,
         source_settings: &source_settings,
+        cancel: None,
     };
     let result = run_source(source, &ctx);
 
@@ -1149,6 +1179,24 @@ fn run_choose(
     let mut candidates_cache: Vec<WallpaperCandidate> = Vec::new();
     let mut candidates_dirty = true;
     current_settings.refresh_metadata = false;
+    let cancel = CancelFlag::new();
+    let fetch_active = Arc::new(AtomicBool::new(false));
+    if let Err(err) = ctrlc::set_handler({
+        let cancel = cancel.clone();
+        let fetch_active = fetch_active.clone();
+        move || {
+            if fetch_active.load(Ordering::SeqCst) {
+                cancel.set();
+            } else {
+                std::process::exit(130);
+            }
+        }
+    }) {
+        log(
+            &format!("Unable to install Ctrl-C handler: {err}"),
+            settings.quiet,
+        );
+    }
 
     let normalize_label = |value: &str| {
         value
@@ -1166,10 +1214,19 @@ fn run_choose(
             .map(|f| f.id.clone())
             .collect();
         if candidates_dirty {
-            candidates_cache = filter_candidates_by_min_resolution(
-                gather_candidates(client, cache, registry, &current_settings, source_settings)?,
+            cancel.clear();
+            fetch_active.store(true, Ordering::SeqCst);
+            let fetched = gather_candidates(
+                client,
+                cache,
+                registry,
                 &current_settings,
-            )?;
+                source_settings,
+                &cancel,
+            );
+            fetch_active.store(false, Ordering::SeqCst);
+            candidates_cache =
+                filter_candidates_by_min_resolution(fetched?, &current_settings)?;
             // Force should be one-shot in the chooser to avoid repeated re-downloads.
             current_settings.force = false;
             current_settings.refresh_metadata = false;
@@ -1457,6 +1514,7 @@ fn gather_candidates(
     registry: &SourceRegistry,
     settings: &Settings,
     source_settings: &SourceSettings,
+    cancel: &CancelFlag,
 ) -> Result<Vec<WallpaperCandidate>> {
     let mut result = Vec::new();
     let mut skipped_summaries: Vec<String> = Vec::new();
@@ -1477,8 +1535,11 @@ fn gather_candidates(
         }
     };
 
-    for source in registry.all() {
-        let date_label = date_label_for(Some(source), settings, source_settings);
+    for source in registry.all_cloned() {
+        if cancel.is_set() {
+            cancel.clear();
+        }
+        let date_label = date_label_for(Some(source.as_ref()), settings, source_settings);
         if !settings.force {
             if cache
                 .read_in_progress(&date_label, source.id())?
@@ -1493,20 +1554,62 @@ fn gather_candidates(
                 continue;
             }
         }
-        let ctx = SourceContext {
-            client,
-            cache,
-            settings,
-            date_label: &date_label,
-            source_settings,
-        };
         let _ = cache.write_in_progress(&date_label, source.id());
         let spinner = start_spinner(
             settings,
             format!("Fetching {} (Ctrl+C to cancel)…", source.label()),
         );
-        match source.fetch(&ctx) {
-            Ok(fetched) => {
+        let (tx, rx) = mpsc::channel();
+        let thread_client = client.clone();
+        let thread_cache = cache.clone();
+        let thread_settings = settings.clone();
+        let thread_source_settings = source_settings.clone();
+        let thread_date_label = date_label.clone();
+        let thread_cancel = cancel.clone();
+        let thread_source = source.clone();
+        thread::spawn(move || {
+            let ctx = SourceContext {
+                client: &thread_client,
+                cache: &thread_cache,
+                settings: &thread_settings,
+                date_label: &thread_date_label,
+                source_settings: &thread_source_settings,
+                cancel: Some(&thread_cancel),
+            };
+            let _ = tx.send(thread_source.fetch(&ctx));
+        });
+
+        let mut cancel_current = false;
+        let fetch_result = loop {
+            if cancel.is_set() {
+                cancel_current = true;
+                break None;
+            }
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(res) => break Some(res),
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(_) => break Some(Err(WallpaperError::Message(
+                    "Fetch thread disconnected unexpectedly.".to_string(),
+                ))),
+            }
+        };
+
+        if cancel_current {
+            cache.clear_in_progress(&date_label, source.id());
+            finish_spinner(spinner, "", settings, true);
+            let _ = cache.write_skip(&date_label, source.id(), "canceled");
+            skipped_summaries.push(format!("{} skipped (canceled).", source.label()));
+            log(
+                &format!("Canceled {}; continuing.", source.label()),
+                settings.quiet,
+            );
+            cancel.clear();
+            continue;
+        }
+
+        let mut skip_source = false;
+        match fetch_result {
+            Some(Ok(fetched)) => {
                 cache.clear_in_progress(&date_label, source.id());
                 finish_spinner(
                     spinner,
@@ -1516,10 +1619,17 @@ fn gather_candidates(
                 );
                 result.extend(fetched.candidates);
             }
-            Err(err) => {
+            Some(Err(err)) => {
                 cache.clear_in_progress(&date_label, source.id());
                 finish_spinner(spinner, "", settings, true);
                 let mut skip_reason: Option<String> = None;
+                let cancel_requested =
+                    cancel.is_set() || matches!(err, WallpaperError::Canceled);
+                if cancel_requested {
+                    let _ = cache.write_skip(&date_label, source.id(), "canceled");
+                    skip_reason = Some("canceled".to_string());
+                    skip_source = true;
+                }
                 if !settings.force {
                     if let Ok(Some(skip)) = cache.read_skip(&date_label, source.id()) {
                         skip_reason = Some(skip.reason);
@@ -1546,6 +1656,16 @@ fn gather_candidates(
                     log_verbose(&msg, settings);
                 }
             }
+            None => {}
+        }
+
+        if skip_source {
+            log(
+                &format!("Canceled {}; continuing.", source.label()),
+                settings.quiet,
+            );
+            cancel.clear();
+            continue;
         }
     }
 
@@ -1568,6 +1688,7 @@ fn download_to_path(
     url: &str,
     target_path: &Path,
     settings: &Settings,
+    cancel: Option<&CancelFlag>,
 ) -> Result<DownloadedFile> {
     if settings.offline {
         return Err(WallpaperError::Message(
@@ -1600,7 +1721,17 @@ fn download_to_path(
         let mut response = client.get(url).timeout(IMAGE_TIMEOUT).send()?;
         ensure_http_success(response.status(), url)?;
         let mut file = File::create(&temp_path)?;
-        response.copy_to(&mut file)?;
+        let mut buf = [0u8; 32 * 1024];
+        loop {
+            if cancel.is_some_and(|flag| flag.is_set()) {
+                return Err(WallpaperError::Canceled);
+            }
+            let bytes_read = response.read(&mut buf)?;
+            if bytes_read == 0 {
+                break;
+            }
+            file.write_all(&buf[..bytes_read])?;
+        }
         file.flush()?;
         file.sync_all()?;
         fs::rename(&temp_path, target_path)?;
@@ -1627,6 +1758,25 @@ fn download_to_path(
     Ok(DownloadedFile {
         path: target_path.to_path_buf(),
     })
+}
+
+pub(crate) fn read_response_bytes_with_cancel(
+    mut response: reqwest::blocking::Response,
+    cancel: Option<&CancelFlag>,
+) -> Result<Vec<u8>> {
+    let mut buf = [0u8; 32 * 1024];
+    let mut out = Vec::new();
+    loop {
+        if cancel.is_some_and(|flag| flag.is_set()) {
+            return Err(WallpaperError::Canceled);
+        }
+        let bytes_read = response.read(&mut buf)?;
+        if bytes_read == 0 {
+            break;
+        }
+        out.extend_from_slice(&buf[..bytes_read]);
+    }
+    Ok(out)
 }
 
 pub(crate) fn enforce_min_resolution(path: &Path, settings: &Settings) -> Result<()> {
@@ -2384,6 +2534,7 @@ mod tests {
             settings,
             date_label,
             source_settings,
+            cancel: None,
         };
         run_source(source, &ctx)
     }
@@ -2451,6 +2602,7 @@ mod tests {
             metadata,
             &cache,
             date_label,
+            None,
         )
         .unwrap();
         assert!(downloaded.skipped);
@@ -2496,6 +2648,7 @@ mod tests {
             metadata,
             &cache,
             date_label,
+            None,
         )
         .unwrap();
         assert!(!downloaded.skipped);
@@ -2546,6 +2699,7 @@ mod tests {
             metadata,
             &cache,
             date_label,
+            None,
         )
         .unwrap_err();
         assert!(matches!(err, WallpaperError::DownloadStatus { .. }));

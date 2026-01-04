@@ -1,6 +1,7 @@
 use crate::{
-    download_to_path, ensure_http_success, log_verbose, CacheManager, Result, Settings,
-    WallpaperCandidate, WallpaperError, WallpaperSource, METADATA_TIMEOUT,
+    download_to_path, ensure_http_success, log_verbose, read_response_bytes_with_cancel,
+    CacheManager, Result, Settings, WallpaperCandidate, WallpaperError, WallpaperSource,
+    METADATA_TIMEOUT,
 };
 use reqwest::blocking::Client;
 use serde::Deserialize;
@@ -91,6 +92,7 @@ impl Source for SpotlightSource {
             ctx.settings,
             ctx.date_label,
             &ctx.source_settings.spotlight,
+            ctx.cancel,
         )?;
         Ok(FetchResult {
             candidates,
@@ -171,6 +173,7 @@ pub(crate) fn fetch_spotlight_candidates(
     settings: &Settings,
     date_label: &str,
     spotlight_settings: &SpotlightSettings,
+    cancel: Option<&crate::CancelFlag>,
 ) -> Result<Vec<WallpaperCandidate>> {
     if !settings.force {
         if let Some(skip) = cache.read_skip(date_label, WallpaperSource::Spotlight)? {
@@ -210,7 +213,7 @@ pub(crate) fn fetch_spotlight_candidates(
     log_verbose(&format!("Fetching Spotlight feed: {}", url), settings);
     let response = client.get(url.clone()).timeout(METADATA_TIMEOUT).send()?;
     ensure_http_success(response.status(), &url)?;
-    let body = response.bytes()?.to_vec();
+    let body = read_response_bytes_with_cancel(response, cancel)?;
     let payloads = parse_spotlight_payloads(&body)?;
     if payloads.is_empty() {
         return Err(WallpaperError::Message(
@@ -231,7 +234,8 @@ pub(crate) fn fetch_spotlight_candidates(
         let file_name = format!("spotlight_{date_label}_{ordinal}.jpg");
         let local_path = media_dir.join(file_name);
 
-        let download = match download_to_path(client, &asset_url, &local_path, settings) {
+        let download =
+            match download_to_path(client, &asset_url, &local_path, settings, cancel) {
             Ok(download) => download,
             Err(err) => {
                 if matches!(err, WallpaperError::MinResolution { .. }) {
