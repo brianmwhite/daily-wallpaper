@@ -186,6 +186,7 @@ struct Settings {
     min_resolution: Option<(u32, u32)>,
     log_file: Option<PathBuf>,
     log_file_max_bytes: u64,
+    disabled_sources: HashSet<WallpaperSource>,
 }
 
 #[derive(Debug, Clone)]
@@ -267,6 +268,8 @@ struct InProgressFetch {
 struct AppConfig {
     #[serde(default)]
     default_source: Option<ConfigSource>,
+    #[serde(default)]
+    disabled_sources: Option<Vec<ConfigSource>>,
     #[serde(default)]
     monitor: Option<usize>,
     #[serde(default)]
@@ -593,6 +596,15 @@ struct Cli {
     #[arg(long = "offline", action = ArgAction::SetTrue, help = "Use cached wallpapers only; never download.")]
     offline: bool,
 
+    #[arg(
+        long = "disable-source",
+        value_enum,
+        action = ArgAction::Append,
+        value_delimiter = ',',
+        help = "Disable a source (repeatable or comma-separated)."
+    )]
+    disable_sources: Vec<SourceArg>,
+
     #[arg(short = 'n', long = "filename")]
     filename: Option<String>,
 
@@ -633,6 +645,7 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
     let picture_override = arg_present(&raw_args, &["-p", "--picturedir"]);
     let verbosity_override = args.quiet || args.verbose;
     let offline_override = arg_present(&raw_args, &["--offline"]);
+    let disabled_sources = resolve_disabled_sources(config.as_ref(), &args.disable_sources);
 
     let monitor = {
         let mut monitor_val = args.monitor;
@@ -764,6 +777,7 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
         min_resolution,
         log_file,
         log_file_max_bytes,
+        disabled_sources,
     };
     set_log_file(settings.log_file.clone(), settings.log_file_max_bytes);
 
@@ -870,6 +884,13 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
 
     ensure_picture_dir(&settings.picture_dir)?;
 
+    if settings.disabled_sources.contains(&settings.source) {
+        return Err(WallpaperError::Message(format!(
+            "Source {} is disabled. Remove it from disabled_sources or choose another source.",
+            source_label(settings.source)
+        )));
+    }
+
     let source = require_source(&registry, settings.source)?;
     let date_label = date_label_for(Some(source), &settings, &source_settings);
     let ctx = SourceContext {
@@ -922,6 +943,24 @@ fn arg_present(args: &[String], flags: &[&str]) -> bool {
         }
     }
     false
+}
+
+fn resolve_disabled_sources(
+    config: Option<&AppConfig>,
+    cli_sources: &[SourceArg],
+) -> HashSet<WallpaperSource> {
+    let mut disabled = HashSet::new();
+    if let Some(cfg) = config {
+        if let Some(list) = &cfg.disabled_sources {
+            for source in list {
+                disabled.insert(map_source((*source).into()));
+            }
+        }
+    }
+    for source in cli_sources {
+        disabled.insert(map_source(source.clone()));
+    }
+    disabled
 }
 
 fn launchd_dir() -> PathBuf {
@@ -1518,6 +1557,12 @@ fn gather_candidates(
 ) -> Result<Vec<WallpaperCandidate>> {
     let mut result = Vec::new();
     let mut skipped_summaries: Vec<String> = Vec::new();
+    let sources = registry.all_enabled(&settings.disabled_sources);
+    if sources.is_empty() {
+        return Err(WallpaperError::Message(
+            "All sources are disabled.".to_string(),
+        ));
+    }
 
     let skip_reason_for_error = |err: &WallpaperError| -> Option<String> {
         match err {
@@ -1535,7 +1580,7 @@ fn gather_candidates(
         }
     };
 
-    for source in registry.all_cloned() {
+    for source in sources {
         if cancel.is_set() {
             cancel.clear();
         }
@@ -2515,6 +2560,7 @@ mod tests {
             min_resolution: None,
             log_file: None,
             log_file_max_bytes: 5120 * 1024,
+            disabled_sources: HashSet::new(),
         }
     }
 

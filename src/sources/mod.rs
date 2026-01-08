@@ -5,6 +5,7 @@ pub mod spotlight;
 
 use crate::{CacheManager, CancelFlag, Result, Settings, WallpaperCandidate, WallpaperSource};
 use reqwest::blocking::Client;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 pub struct SourceContext<'a> {
@@ -81,8 +82,12 @@ impl SourceRegistry {
             .map(|boxed| boxed.as_ref())
     }
 
-    pub fn all_cloned(&self) -> Vec<Arc<dyn Source>> {
-        self.sources.clone()
+    pub fn all_enabled(&self, disabled: &HashSet<WallpaperSource>) -> Vec<Arc<dyn Source>> {
+        self.sources
+            .iter()
+            .filter(|src| !disabled.contains(&src.id()))
+            .cloned()
+            .collect()
     }
 }
 

@@ -443,6 +443,7 @@ mod tests {
     use httpmock::Method::GET;
     use httpmock::MockServer;
     use image::{ImageBuffer, Rgba};
+    use std::collections::HashSet;
     use std::path::Path;
     use tempfile::tempdir;
 
@@ -467,6 +468,7 @@ mod tests {
             min_resolution: None,
             log_file: None,
             log_file_max_bytes: 5120 * 1024,
+            disabled_sources: HashSet::new(),
         }
     }
 

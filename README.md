@@ -110,8 +110,11 @@ daily-wallpaper info
 ## Configuration (`~/.wallpaperconfig`)
 
 ```toml
-# Default source: bing | spotlight | apod
+# Default source: bing | spotlight | apod | modis
 default_source = "bing"
+
+# Disable sources globally (lowercase names)
+disabled_sources = ["spotlight"]
 
 # Target monitor (0 = all)
 monitor = 0
@@ -162,6 +165,7 @@ crop = true
 ```
 
 - CLI flags and environment variables override config values where applicable (e.g., `--monitor`, `--picturedir`, `NASA_API_KEY`).
+- `disabled_sources` is merged with `--disable-source` (union).
 - `apod.api_key` can also be provided as a top-level `apod_api_key = "..."` (backward compatibility).
 - `resolutions` apply to Bing only; Spotlight ignores them; APOD always downloads full resolution.
 - `verbosity` sets the default; `--quiet`/`--verbose` still take precedence.
@@ -191,6 +195,7 @@ All chooser/apply/cache logic is source-agnostic; new sources should not require
 
   --prune-cache-days <n>         After a successful run, delete cached days older than <n> days.
   --offline                      Use cached wallpapers only; never download or hit the network.
+  --disable-source <source>      Disable a source (repeatable or comma-separated).
   --auto-update-name <name>      Name for the auto-update job (default: default).
   -f --force                     Force download even if the file already exists.
   -s --ssl                       Communicate with bing.com over HTTPS (default; use --no-ssl to opt out).
