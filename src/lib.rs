@@ -842,44 +842,12 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
         None => {}
     }
 
-    if !settings.force {
-        if let Some(last) = cache.read_last_applied()? {
-            let today = Local::now().date_naive().to_string();
-            if let Some(applied_at) = Local.timestamp_opt(last.applied_at as i64, 0).single() {
-                if applied_at.date_naive().to_string() == today {
-                    log(
-                        "Wallpaper already set today; skipping auto update.",
-                        settings.quiet,
-                    );
-                    return Ok(());
-                }
-            }
-            let mut last_date = last.date.clone();
-            if last.source == WallpaperSource::Bing {
-                let cached_candidate = last
-                    .date
-                    .as_deref()
-                    .and_then(|date| cache.find_candidate_by_id(date, &last.candidate_id).ok())
-                    .flatten()
-                    .or_else(|| cache.find_candidate_any_date(&last.candidate_id).ok().flatten());
-                if let Some(candidate) = cached_candidate {
-                    if let Some(xml) = candidate.metadata_xml.as_deref() {
-                        if let Ok(Some(metadata_date)) =
-                            sources::bing::metadata_date_label(xml.as_bytes())
-                        {
-                            last_date = Some(metadata_date);
-                        }
-                    }
-                }
-            }
-            if last_date.as_deref() == Some(today.as_str()) {
-                log(
-                    "Wallpaper already set today; skipping auto update.",
-                    settings.quiet,
-                );
-                return Ok(());
-            }
-        }
+    if !settings.force && should_skip_auto_update(&cache, &settings)? {
+        log(
+            "Wallpaper already set today; skipping auto update.",
+            settings.quiet,
+        );
+        return Ok(());
     }
 
     ensure_picture_dir(&settings.picture_dir)?;
@@ -910,6 +878,41 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
     }
 
     result
+}
+
+fn should_skip_auto_update(cache: &CacheManager, _settings: &Settings) -> Result<bool> {
+    let Some(last) = cache.read_last_applied()? else {
+        return Ok(false);
+    };
+    let today = Local::now().date_naive().to_string();
+    let mut last_date = last.date.clone();
+    if last.source == WallpaperSource::Bing {
+        let cached_candidate = last
+            .date
+            .as_deref()
+            .and_then(|date| cache.find_candidate_by_id(date, &last.candidate_id).ok())
+            .flatten()
+            .or_else(|| cache.find_candidate_any_date(&last.candidate_id).ok().flatten());
+        if let Some(candidate) = cached_candidate {
+            if let Some(xml) = candidate.metadata_xml.as_deref() {
+                if let Ok(Some(metadata_date)) = sources::bing::metadata_date_label(xml.as_bytes())
+                {
+                    last_date = Some(metadata_date);
+                }
+            }
+        }
+    }
+    if last_date.as_deref() == Some(today.as_str()) {
+        return Ok(true);
+    }
+    if last.source != WallpaperSource::Bing {
+        if let Some(applied_at) = Local.timestamp_opt(last.applied_at as i64, 0).single() {
+            if applied_at.date_naive().to_string() == today {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn build_client() -> Result<Client> {
@@ -3142,6 +3145,135 @@ mod tests {
         let err = show_info(&cache, &settings, &mut buffer).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("previously applied wallpaper"));
+    }
+
+    #[test]
+    fn auto_update_does_not_skip_bing_when_metadata_not_today() {
+        let tmpdir = tempdir().unwrap();
+        let cache = CacheManager::new(tmpdir.path());
+        let today = Local::now().date_naive();
+        let yesterday = today - ChronoDuration::days(1);
+        let startdate = yesterday.format("%Y%m%d").to_string();
+        let metadata_xml = format!(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?><images><image><startdate>{}</startdate></image></images>",
+            startdate
+        );
+        let candidate = WallpaperCandidate {
+            id: format!("bing-{}-en-US-1920x1080", yesterday),
+            source: WallpaperSource::Bing,
+            title: None,
+            description: None,
+            attribution: None,
+            info_url: None,
+            image_url: "https://example.com/image.jpg".into(),
+            local_path: tmpdir.path().join("wallpaper.jpg"),
+            date: yesterday.to_string(),
+            metadata_xml: Some(metadata_xml),
+            checksum: None,
+        };
+
+        cache
+            .upsert_candidate(&candidate.date, candidate.clone())
+            .unwrap();
+        cache
+            .write_last_applied(&LastApplied {
+                candidate_id: candidate.id.clone(),
+                source: candidate.source,
+                applied_path: candidate.local_path.clone(),
+                applied_at: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                date: Some(candidate.date.clone()),
+            })
+            .unwrap();
+
+        let settings = make_settings(tmpdir.path(), None, false);
+        assert!(!should_skip_auto_update(&cache, &settings).unwrap());
+    }
+
+    #[test]
+    fn auto_update_skips_bing_when_metadata_is_today() {
+        let tmpdir = tempdir().unwrap();
+        let cache = CacheManager::new(tmpdir.path());
+        let today = Local::now().date_naive();
+        let startdate = today.format("%Y%m%d").to_string();
+        let metadata_xml = format!(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?><images><image><startdate>{}</startdate></image></images>",
+            startdate
+        );
+        let candidate = WallpaperCandidate {
+            id: format!("bing-{}-en-US-1920x1080", today),
+            source: WallpaperSource::Bing,
+            title: None,
+            description: None,
+            attribution: None,
+            info_url: None,
+            image_url: "https://example.com/image.jpg".into(),
+            local_path: tmpdir.path().join("wallpaper.jpg"),
+            date: today.to_string(),
+            metadata_xml: Some(metadata_xml),
+            checksum: None,
+        };
+
+        cache
+            .upsert_candidate(&candidate.date, candidate.clone())
+            .unwrap();
+        cache
+            .write_last_applied(&LastApplied {
+                candidate_id: candidate.id.clone(),
+                source: candidate.source,
+                applied_path: candidate.local_path.clone(),
+                applied_at: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                date: Some(candidate.date.clone()),
+            })
+            .unwrap();
+
+        let settings = make_settings(tmpdir.path(), None, false);
+        assert!(should_skip_auto_update(&cache, &settings).unwrap());
+    }
+
+    #[test]
+    fn auto_update_skips_non_bing_when_applied_today() {
+        let tmpdir = tempdir().unwrap();
+        let cache = CacheManager::new(tmpdir.path());
+        let yesterday = (Local::now().date_naive() - ChronoDuration::days(1)).to_string();
+        let candidate = WallpaperCandidate {
+            id: format!("spotlight-{}-1", yesterday),
+            source: WallpaperSource::Spotlight,
+            title: None,
+            description: None,
+            attribution: None,
+            info_url: None,
+            image_url: "https://example.com/spotlight.jpg".into(),
+            local_path: tmpdir.path().join("spotlight.jpg"),
+            date: yesterday.clone(),
+            metadata_xml: None,
+            checksum: None,
+        };
+
+        cache
+            .upsert_candidate(&candidate.date, candidate.clone())
+            .unwrap();
+        cache
+            .write_last_applied(&LastApplied {
+                candidate_id: candidate.id.clone(),
+                source: candidate.source,
+                applied_path: candidate.local_path.clone(),
+                applied_at: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                date: Some(candidate.date.clone()),
+            })
+            .unwrap();
+
+        let mut settings = make_settings(tmpdir.path(), None, false);
+        settings.source = WallpaperSource::Spotlight;
+        assert!(should_skip_auto_update(&cache, &settings).unwrap());
     }
 
     fn dummy_candidate(tmpdir: &Path, id: &str) -> WallpaperCandidate {
