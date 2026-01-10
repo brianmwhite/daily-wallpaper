@@ -1,10 +1,18 @@
 [package]
 name = "daily-wallpaper"
-version = "2.7.0"
+version = "2.7.1"
 edition = "2021"
 description = "Download various daily wallpaper options to set it across macOS desktops and monitors."
 license = "GPL-3.0-or-later"
 authors = ["Lukas Pikora", "Brian White"]
+
+[features]
+bump-version = []
+
+[[bin]]
+name = "bump_version"
+path = "src/bin/bump_version.rs"
+required-features = ["bump-version"]
 
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock"] }

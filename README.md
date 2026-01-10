@@ -29,6 +29,12 @@ cargo install --path .
 daily-wallpaper
 ```
 
+Note: the version bump helper is feature-gated and is not installed by default. Use `scripts/bump_version.sh` from the repo, or run it explicitly with:
+
+```sh
+cargo run --features bump-version --bin bump_version -- [major|minor|patch]
+```
+
 ## Quick start
 
 - Run once from the repo (no install):
