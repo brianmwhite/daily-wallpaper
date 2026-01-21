@@ -321,6 +321,8 @@ struct LastApplied {
     applied_path: PathBuf,
     applied_at: u64,
     #[serde(default)]
+    applied_by_user: bool,
+    #[serde(default)]
     date: Option<String>,
 }
 
@@ -885,6 +887,13 @@ fn should_skip_auto_update(cache: &CacheManager, _settings: &Settings) -> Result
         return Ok(false);
     };
     let today = Local::now().date_naive().to_string();
+    if last.applied_by_user {
+        if let Some(applied_at) = Local.timestamp_opt(last.applied_at as i64, 0).single() {
+            if applied_at.date_naive().to_string() == today {
+                return Ok(true);
+            }
+        }
+    }
     let mut last_date = last.date.clone();
     if last.source == WallpaperSource::Bing {
         let cached_candidate = last
@@ -1154,6 +1163,7 @@ fn run_source(source: &dyn Source, ctx: &SourceContext<'_>) -> Result<()> {
         &candidate.id,
         candidate.source,
         Some(&candidate.date),
+        false,
     )
 }
 
@@ -1390,6 +1400,7 @@ fn run_choose(
                             &cand.id,
                             cand.source,
                             Some(&cand.date),
+                            true,
                         ) {
                             Ok(()) => return Ok(()),
                             Err(err) => println!("Failed to apply wallpaper: {err}"),
@@ -1522,6 +1533,7 @@ fn run_favorites_menu(
                         &fav.id,
                         fav.source,
                         Some(&fav.date),
+                        true,
                     ) {
                         Ok(()) => return Ok(()),
                         Err(err) => println!("Failed to apply wallpaper: {err}"),
@@ -1952,6 +1964,7 @@ fn apply_wallpaper(
     candidate_id: &str,
     source: WallpaperSource,
     candidate_date: Option<&str>,
+    applied_by_user: bool,
 ) -> Result<()> {
     let result = if settings.experimental {
         set_wallpaper_experimental(file_path, settings.quiet)
@@ -1968,6 +1981,7 @@ fn apply_wallpaper(
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
+            applied_by_user,
             date: candidate_date.map(|d| d.to_string()),
         };
         cache.write_last_applied(&applied)?;
@@ -2005,6 +2019,7 @@ fn reapply_last_wallpaper(cache: &CacheManager, settings: &Settings) -> Result<(
         &last.candidate_id,
         last.source,
         last.date.as_deref(),
+        true,
     )
 }
 
@@ -3122,6 +3137,7 @@ mod tests {
                 source: candidate.source,
                 applied_path: candidate.local_path.clone(),
                 applied_at: 0,
+                applied_by_user: false,
                 date: Some(candidate.date.clone()),
             })
             .unwrap();
@@ -3184,12 +3200,59 @@ mod tests {
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs(),
+                applied_by_user: false,
                 date: Some(candidate.date.clone()),
             })
             .unwrap();
 
         let settings = make_settings(tmpdir.path(), None, false);
         assert!(!should_skip_auto_update(&cache, &settings).unwrap());
+    }
+
+    #[test]
+    fn auto_update_skips_bing_when_user_applied_today() {
+        let tmpdir = tempdir().unwrap();
+        let cache = CacheManager::new(tmpdir.path());
+        let today = Local::now().date_naive();
+        let yesterday = today - ChronoDuration::days(1);
+        let startdate = yesterday.format("%Y%m%d").to_string();
+        let metadata_xml = format!(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?><images><image><startdate>{}</startdate></image></images>",
+            startdate
+        );
+        let candidate = WallpaperCandidate {
+            id: format!("bing-{}-en-US-1920x1080", yesterday),
+            source: WallpaperSource::Bing,
+            title: None,
+            description: None,
+            attribution: None,
+            info_url: None,
+            image_url: "https://example.com/image.jpg".into(),
+            local_path: tmpdir.path().join("wallpaper.jpg"),
+            date: yesterday.to_string(),
+            metadata_xml: Some(metadata_xml),
+            checksum: None,
+        };
+
+        cache
+            .upsert_candidate(&candidate.date, candidate.clone())
+            .unwrap();
+        cache
+            .write_last_applied(&LastApplied {
+                candidate_id: candidate.id.clone(),
+                source: candidate.source,
+                applied_path: candidate.local_path.clone(),
+                applied_at: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                applied_by_user: true,
+                date: Some(candidate.date.clone()),
+            })
+            .unwrap();
+
+        let settings = make_settings(tmpdir.path(), None, false);
+        assert!(should_skip_auto_update(&cache, &settings).unwrap());
     }
 
     #[test]
@@ -3228,6 +3291,7 @@ mod tests {
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs(),
+                applied_by_user: false,
                 date: Some(candidate.date.clone()),
             })
             .unwrap();
@@ -3267,6 +3331,7 @@ mod tests {
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs(),
+                applied_by_user: false,
                 date: Some(candidate.date.clone()),
             })
             .unwrap();
