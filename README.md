@@ -53,11 +53,13 @@ cargo run --features bump-version --bin bump_version -- [major|minor|patch]
 
 ## Usage
 
-- Download today’s Bing wallpaper to the default directory and apply to all desktops (default behavior):
+- Run with no arguments at an interactive terminal to get a menu of the three everyday commands (Choose / Info / Reapply):
 
   ```sh
   daily-wallpaper
   ```
+
+  When stdin/stdout aren't both a terminal (scripts, cron, `launchd`), bare invocation instead runs the auto-update fetch-and-apply body directly — this is what `enable-auto-update` schedules.
 
 - Apply to a specific monitor (e.g., second display):
 

@@ -11,7 +11,7 @@ use image::image_dimensions;
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
@@ -44,6 +44,7 @@ const USER_AGENT: &str = concat!(
 const METADATA_TIMEOUT: Duration = Duration::from_secs(30);
 const IMAGE_TIMEOUT: Duration = Duration::from_secs(60);
 const PLIST_BASENAME: &str = "com.thirdember.daily-wallpaper";
+const AUTO_UPDATE_RUN_ARG: &str = "auto-update-run";
 const CACHE_DIR_NAME: &str = "cache";
 const CACHE_INDEX_FILE: &str = "index.json";
 const LAST_APPLIED_FILE: &str = "last_applied.json";
@@ -557,6 +558,8 @@ enum CommandArg {
     )]
     Choose,
     Reapply,
+    #[value(hide = true)]
+    AutoUpdateRun,
 }
 
 
@@ -819,16 +822,14 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
         Some(CommandArg::DisplaySync) => {
             return run_display_sync(&cache, &settings);
         }
+        Some(CommandArg::AutoUpdateRun) => {
+            return run_auto_update_body(&cache, &settings, &registry, &client, &source_settings);
+        }
         Some(CommandArg::Info) => {
-            let stdout = io::stdout();
-            let mut handle = stdout.lock();
-            show_info(&cache, &settings, &mut handle)?;
-            return Ok(());
+            return dispatch_info(&cache, &settings);
         }
         Some(CommandArg::Choose) => {
-            ensure_picture_dir(&settings.picture_dir)?;
-            ensure_picture_dir(&settings.favorites_dir)?;
-            return run_choose(
+            return dispatch_choose(
                 &client,
                 &cache,
                 &favorites,
@@ -838,13 +839,137 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
             );
         }
         Some(CommandArg::Reapply) => {
-            ensure_picture_dir(&settings.picture_dir)?;
-            return reapply_last_wallpaper(&cache, &settings);
+            return dispatch_reapply(&cache, &settings);
         }
-        None => {}
+        None => {
+            if io::stdin().is_terminal() && io::stdout().is_terminal() {
+                match prompt_parent_menu() {
+                    Ok(choice) => {
+                        return run_menu_selection(
+                            choice,
+                            &client,
+                            &cache,
+                            &favorites,
+                            &registry,
+                            &settings,
+                            &source_settings,
+                        );
+                    }
+                    Err(InquireError::OperationCanceled) => {
+                        return Ok(());
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
     }
 
-    if !settings.force && should_skip_auto_update(&cache, &settings)? {
+    self_heal_auto_update_plist(&settings, &raw_args)?;
+    run_auto_update_body(&cache, &settings, &registry, &client, &source_settings)
+}
+
+fn dispatch_info(cache: &CacheManager, settings: &Settings) -> Result<()> {
+    let stdout = io::stdout();
+    let mut handle = stdout.lock();
+    show_info(cache, settings, &mut handle)
+}
+
+fn dispatch_choose(
+    client: &Client,
+    cache: &CacheManager,
+    favorites: &FavoritesManager,
+    registry: &SourceRegistry,
+    settings: &Settings,
+    source_settings: &SourceSettings,
+) -> Result<()> {
+    ensure_picture_dir(&settings.picture_dir)?;
+    ensure_picture_dir(&settings.favorites_dir)?;
+    run_choose(client, cache, favorites, registry, settings, source_settings)
+}
+
+fn dispatch_reapply(cache: &CacheManager, settings: &Settings) -> Result<()> {
+    ensure_picture_dir(&settings.picture_dir)?;
+    reapply_last_wallpaper(cache, settings)
+}
+
+enum ParentMenuChoice {
+    Choose,
+    Info,
+    Reapply,
+}
+
+fn prompt_parent_menu() -> std::result::Result<ParentMenuChoice, InquireError> {
+    const CHOOSE: &str = "Choose a wallpaper";
+    const INFO: &str = "Show info about the current wallpaper";
+    const REAPPLY: &str = "Reapply the last wallpaper";
+
+    let selection = Select::new("What would you like to do?", vec![CHOOSE, INFO, REAPPLY]).prompt()?;
+    Ok(match selection {
+        CHOOSE => ParentMenuChoice::Choose,
+        INFO => ParentMenuChoice::Info,
+        REAPPLY => ParentMenuChoice::Reapply,
+        _ => unreachable!("inquire only returns one of the provided options"),
+    })
+}
+
+fn run_menu_selection(
+    choice: ParentMenuChoice,
+    client: &Client,
+    cache: &CacheManager,
+    favorites: &FavoritesManager,
+    registry: &SourceRegistry,
+    settings: &Settings,
+    source_settings: &SourceSettings,
+) -> Result<()> {
+    match choice {
+        ParentMenuChoice::Choose => {
+            dispatch_choose(client, cache, favorites, registry, settings, source_settings)
+        }
+        ParentMenuChoice::Info => dispatch_info(cache, settings),
+        ParentMenuChoice::Reapply => dispatch_reapply(cache, settings),
+    }
+}
+
+fn self_heal_auto_update_plist(settings: &Settings, raw_args: &[String]) -> Result<()> {
+    let plist_path = settings.plist_filename();
+    if !plist_path.exists() {
+        return Ok(());
+    }
+    if plist_has_auto_update_run_token(&plist_path)? {
+        return Ok(());
+    }
+    create_launchd_plist(settings, raw_args)
+}
+
+fn plist_program_arguments(path: &Path) -> Result<Vec<String>> {
+    let value = Value::from_file(path)?;
+    Ok(value
+        .as_dictionary()
+        .and_then(|dict| dict.get("ProgramArguments"))
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|v| v.as_string().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+fn plist_has_auto_update_run_token(path: &Path) -> Result<bool> {
+    Ok(plist_program_arguments(path)?
+        .iter()
+        .any(|arg| arg == AUTO_UPDATE_RUN_ARG))
+}
+
+fn run_auto_update_body(
+    cache: &CacheManager,
+    settings: &Settings,
+    registry: &SourceRegistry,
+    client: &Client,
+    source_settings: &SourceSettings,
+) -> Result<()> {
+    if !settings.force && should_skip_auto_update(cache, settings)? {
         log(
             "Wallpaper already set today; skipping auto update.",
             settings.quiet,
@@ -861,21 +986,21 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
         )));
     }
 
-    let source = require_source(&registry, settings.source)?;
-    let date_label = date_label_for(Some(source), &settings, &source_settings);
+    let source = require_source(registry, settings.source)?;
+    let date_label = date_label_for(Some(source), settings, source_settings);
     let ctx = SourceContext {
-        client: &client,
-        cache: &cache,
-        settings: &settings,
+        client,
+        cache,
+        settings,
         date_label: &date_label,
-        source_settings: &source_settings,
+        source_settings,
         cancel: None,
     };
     let result = run_source(source, &ctx);
 
     if result.is_ok() {
         if let Some(days) = settings.prune_cache_days {
-            prune_cache(&cache, days, settings.quiet)?;
+            prune_cache(cache, days, settings.quiet)?;
         }
     }
 
@@ -2120,22 +2245,23 @@ fn set_wallpaper_experimental(file_path: &Path, quiet: bool) -> Result<()> {
     Ok(())
 }
 
+fn auto_update_program_arguments(current_exe: &str, raw_args: &[String]) -> Vec<String> {
+    let mut filtered_args: Vec<String> = raw_args.to_owned();
+    filtered_args.retain(|arg| arg != "enable-auto-update" && arg != AUTO_UPDATE_RUN_ARG);
+
+    let mut program_arguments = vec![current_exe.to_string(), AUTO_UPDATE_RUN_ARG.to_string()];
+    program_arguments.extend(filtered_args);
+    program_arguments
+}
+
 fn create_launchd_plist(settings: &Settings, raw_args: &[String]) -> Result<()> {
     fs::create_dir_all(launchd_dir())?;
-
-    let mut filtered_args: Vec<String> = raw_args.to_owned();
-    if let Some(pos) = filtered_args
-        .iter()
-        .position(|arg| arg == "enable-auto-update")
-    {
-        filtered_args.remove(pos);
-    }
 
     let current_exe = env::current_exe().map_err(|err| {
         WallpaperError::Message(format!("Unable to determine current executable: {err}"))
     })?;
-    let mut program_arguments = vec![current_exe.to_string_lossy().to_string()];
-    program_arguments.extend(filtered_args);
+    let program_arguments =
+        auto_update_program_arguments(&current_exe.to_string_lossy(), raw_args);
 
     let mut plist_map: Dictionary = Dictionary::new();
     plist_map.insert("Label".into(), Value::String(settings.plist_label()));
@@ -3398,5 +3524,237 @@ mod tests {
         let err = manager.save_favorite(&candidate).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("already in favorites"));
+    }
+
+    #[test]
+    fn auto_update_run_is_hidden_from_help() {
+        let help = <Cli as clap::CommandFactory>::command().render_long_help().to_string();
+        assert!(!help.contains(AUTO_UPDATE_RUN_ARG));
+    }
+
+    #[test]
+    fn auto_update_program_arguments_fresh_enable_includes_hidden_subcommand() {
+        let args = auto_update_program_arguments(
+            "/usr/local/bin/daily-wallpaper",
+            &[
+                "enable-auto-update".to_string(),
+                "--auto-update-name".to_string(),
+                "work".to_string(),
+            ],
+        );
+        assert_eq!(
+            args,
+            vec![
+                "/usr/local/bin/daily-wallpaper",
+                AUTO_UPDATE_RUN_ARG,
+                "--auto-update-name",
+                "work",
+            ]
+        );
+    }
+
+    #[test]
+    fn auto_update_program_arguments_rerun_over_existing_schedule_stays_explicit() {
+        // Simulate re-running `enable-auto-update` a second time for a name that
+        // already has an installed plist: raw_args again carries the subcommand
+        // token clap parsed, and the rebuilt ProgramArguments must still contain
+        // exactly one copy of the hidden subcommand, never a duplicate.
+        let first = auto_update_program_arguments(
+            "/usr/local/bin/daily-wallpaper",
+            &["enable-auto-update".to_string()],
+        );
+        assert_eq!(first, vec!["/usr/local/bin/daily-wallpaper", AUTO_UPDATE_RUN_ARG]);
+
+        let rerun = auto_update_program_arguments(
+            "/usr/local/bin/daily-wallpaper",
+            &["enable-auto-update".to_string()],
+        );
+        assert_eq!(rerun, vec!["/usr/local/bin/daily-wallpaper", AUTO_UPDATE_RUN_ARG]);
+    }
+
+    #[test]
+    fn auto_update_program_arguments_never_duplicates_hidden_token() {
+        // If raw_args already contains the hidden token (e.g. a stale plist's
+        // ProgramArguments being reused), it must not be duplicated.
+        let args = auto_update_program_arguments(
+            "/usr/local/bin/daily-wallpaper",
+            &[AUTO_UPDATE_RUN_ARG.to_string()],
+        );
+        assert_eq!(args, vec!["/usr/local/bin/daily-wallpaper", AUTO_UPDATE_RUN_ARG]);
+    }
+
+    fn write_fake_plist(path: &Path, program_arguments: &[&str]) {
+        let mut plist_map: Dictionary = Dictionary::new();
+        plist_map.insert(
+            "ProgramArguments".into(),
+            Value::Array(
+                program_arguments
+                    .iter()
+                    .map(|s| Value::String(s.to_string()))
+                    .collect(),
+            ),
+        );
+        let value = Value::Dictionary(plist_map);
+        let mut bytes = Vec::new();
+        plist::to_writer_xml(&mut bytes, &value).unwrap();
+        fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn plist_has_auto_update_run_token_detects_old_style_plist() {
+        let tmpdir = tempdir().unwrap();
+        let plist_path = tmpdir.path().join("old-style.plist");
+        write_fake_plist(&plist_path, &["/usr/local/bin/daily-wallpaper"]);
+        assert!(!plist_has_auto_update_run_token(&plist_path).unwrap());
+    }
+
+    #[test]
+    fn plist_has_auto_update_run_token_detects_migrated_plist() {
+        let tmpdir = tempdir().unwrap();
+        let plist_path = tmpdir.path().join("migrated.plist");
+        write_fake_plist(
+            &plist_path,
+            &["/usr/local/bin/daily-wallpaper", AUTO_UPDATE_RUN_ARG],
+        );
+        assert!(plist_has_auto_update_run_token(&plist_path).unwrap());
+    }
+
+    #[test]
+    fn self_heal_skips_when_no_plist_exists() {
+        let tmpdir = tempdir().unwrap();
+        let mut settings = make_settings(tmpdir.path(), None, false);
+        settings.auto_update_name = unique_auto_update_name("no-plist");
+        // No plist exists on disk for this auto_update_name, so self-heal must
+        // be a no-op: no file is created and no launchctl call is attempted.
+        self_heal_auto_update_plist(&settings, &[]).unwrap();
+        assert!(!settings.plist_filename().exists());
+    }
+
+    fn unique_auto_update_name(label: &str) -> String {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        format!("test-{label}-{nanos}")
+    }
+
+    #[test]
+    fn auto_update_run_direct_dispatch_never_touches_plist() {
+        // CommandArg::AutoUpdateRun's match arm calls run_auto_update_body
+        // directly and never calls self_heal_auto_update_plist, so a stale,
+        // pre-migration plist on disk for this auto_update_name must be left
+        // completely untouched by that code path.
+        let tmpdir = tempdir().unwrap();
+        let cache = CacheManager::new(tmpdir.path());
+        let yesterday = (Local::now().date_naive() - ChronoDuration::days(1)).to_string();
+        let candidate = WallpaperCandidate {
+            id: format!("spotlight-{}-1", yesterday),
+            source: WallpaperSource::Spotlight,
+            title: None,
+            description: None,
+            attribution: None,
+            info_url: None,
+            image_url: "https://example.com/spotlight.jpg".into(),
+            local_path: tmpdir.path().join("spotlight.jpg"),
+            date: yesterday.clone(),
+            metadata_xml: None,
+            checksum: None,
+        };
+        cache
+            .upsert_candidate(&candidate.date, candidate.clone())
+            .unwrap();
+        cache
+            .write_last_applied(&LastApplied {
+                candidate_id: candidate.id.clone(),
+                source: candidate.source,
+                applied_path: candidate.local_path.clone(),
+                applied_at: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                applied_by_user: false,
+                date: Some(candidate.date.clone()),
+            })
+            .unwrap();
+
+        // Applied today (non-Bing), so should_skip_auto_update short-circuits
+        // run_auto_update_body before any network access.
+        let mut settings = make_settings(tmpdir.path(), None, false);
+        settings.source = WallpaperSource::Spotlight;
+        settings.auto_update_name = unique_auto_update_name("direct-hidden");
+
+        let plist_path = settings.plist_filename();
+        fs::create_dir_all(plist_path.parent().unwrap()).unwrap();
+        write_fake_plist(&plist_path, &["/usr/local/bin/daily-wallpaper"]);
+        let before = fs::read(&plist_path).unwrap();
+
+        let registry = SourceRegistry::new();
+        let client = build_client().unwrap();
+        let source_settings = SourceSettings::from_config(None).unwrap();
+        run_auto_update_body(&cache, &settings, &registry, &client, &source_settings).unwrap();
+
+        let after = fs::read(&plist_path).unwrap();
+        assert_eq!(before, after);
+
+        let _ = fs::remove_file(&plist_path);
+    }
+
+    #[test]
+    fn run_menu_selection_info_matches_dispatch_info_error_path() {
+        let tmpdir = tempdir().unwrap();
+        let cache = CacheManager::new(tmpdir.path());
+        let settings = make_settings(tmpdir.path(), None, false);
+
+        let via_menu = run_menu_selection(
+            ParentMenuChoice::Info,
+            &build_client().unwrap(),
+            &cache,
+            &FavoritesManager::new(tmpdir.path().join("favorites")),
+            &SourceRegistry::new(),
+            &settings,
+            &SourceSettings::from_config(None).unwrap(),
+        );
+        let via_dispatch = dispatch_info(&cache, &settings);
+
+        let via_menu_msg = via_menu.unwrap_err().to_string();
+        let via_dispatch_msg = via_dispatch.unwrap_err().to_string();
+        assert_eq!(via_menu_msg, via_dispatch_msg);
+    }
+
+    #[test]
+    fn run_menu_selection_reapply_matches_dispatch_reapply_error_path() {
+        let tmpdir = tempdir().unwrap();
+        let cache = CacheManager::new(tmpdir.path());
+        let settings = make_settings(tmpdir.path(), None, false);
+
+        let via_menu = run_menu_selection(
+            ParentMenuChoice::Reapply,
+            &build_client().unwrap(),
+            &cache,
+            &FavoritesManager::new(tmpdir.path().join("favorites")),
+            &SourceRegistry::new(),
+            &settings,
+            &SourceSettings::from_config(None).unwrap(),
+        );
+        let via_dispatch = dispatch_reapply(&cache, &settings);
+
+        let via_menu_msg = via_menu.unwrap_err().to_string();
+        let via_dispatch_msg = via_dispatch.unwrap_err().to_string();
+        assert_eq!(via_menu_msg, via_dispatch_msg);
+    }
+
+    #[test]
+    fn explicit_choose_info_reapply_subcommands_parse_unaffected() {
+        let cli = Cli::parse_from(["daily-wallpaper", "info"]);
+        assert!(matches!(cli.command, Some(CommandArg::Info)));
+        let cli = Cli::parse_from(["daily-wallpaper", "choose"]);
+        assert!(matches!(cli.command, Some(CommandArg::Choose)));
+        let cli = Cli::parse_from(["daily-wallpaper", "reapply"]);
+        assert!(matches!(cli.command, Some(CommandArg::Reapply)));
+        let cli = Cli::parse_from(["daily-wallpaper", "auto-update-run"]);
+        assert!(matches!(cli.command, Some(CommandArg::AutoUpdateRun)));
+        let cli = Cli::parse_from(["daily-wallpaper"]);
+        assert!(cli.command.is_none());
     }
 }
