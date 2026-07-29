@@ -4,3 +4,5 @@ src/bing_wallpaper/__pycache__
 # Added by cargo
 
 /target
+/.claude
+/.codex/skills
