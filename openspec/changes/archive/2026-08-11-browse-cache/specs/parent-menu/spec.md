@@ -1,10 +1,4 @@
-# parent-menu
-
-## Purpose
-
-Defines the interactive parent menu shown on bare invocation of `daily-wallpaper` at an interactive terminal, and the conditions under which the auto-update fetch/apply body runs instead.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Interactive parent menu on bare invocation
 When `daily-wallpaper` is run with no subcommand and both stdin and stdout are attached to an interactive terminal, the system SHALL present a selection menu offering exactly four items: Choose, Info, Reapply, and Browse cache, and SHALL NOT run the auto-update fetch/apply body directly.
@@ -27,17 +21,3 @@ Running `daily-wallpaper choose`, `daily-wallpaper info`, or `daily-wallpaper re
 #### Scenario: Explicit subcommand bypasses the menu
 - **WHEN** a user runs `daily-wallpaper choose` (or `info`, or `reapply`) explicitly, interactively or non-interactively
 - **THEN** the corresponding command runs directly with no menu shown, identical to its pre-change behavior
-
-### Requirement: Non-interactive bare invocation runs the auto-update body
-When `daily-wallpaper` is run with no subcommand and stdin or stdout is not an interactive terminal, the system SHALL run the auto-update fetch/apply body (unchanged from current behavior) rather than showing a menu.
-
-#### Scenario: Bare invocation with redirected stdio
-- **WHEN** `daily-wallpaper` is run with no subcommand and either stdin or stdout is redirected (not a TTY) — for example under launchd, cron, or with output piped/redirected to a file
-- **THEN** the system runs the auto-update fetch/apply body exactly as it does today, without attempting to show a menu
-
-### Requirement: Menu failure falls back to the auto-update body
-If the interactive menu cannot be displayed or its prompt fails for any reason after being shown, the system SHALL fall back to running the auto-update fetch/apply body rather than hanging or erroring out.
-
-#### Scenario: Menu prompt errors
-- **WHEN** the terminal is detected as interactive but the menu prompt returns an error instead of a selection
-- **THEN** the system falls back to running the auto-update fetch/apply body instead of exiting with an error or hanging

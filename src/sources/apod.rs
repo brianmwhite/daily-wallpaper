@@ -469,6 +469,7 @@ mod tests {
             log_file: None,
             log_file_max_bytes: 5120 * 1024,
             disabled_sources: HashSet::new(),
+            date_override: None,
         }
     }
 

@@ -188,6 +188,7 @@ struct Settings {
     log_file: Option<PathBuf>,
     log_file_max_bytes: u64,
     disabled_sources: HashSet<WallpaperSource>,
+    date_override: Option<NaiveDate>,
 }
 
 #[derive(Debug, Clone)]
@@ -602,6 +603,12 @@ struct Cli {
     offline: bool,
 
     #[arg(
+        long = "date",
+        help = "Browse a cached date with `choose` (YYYY-MM-DD), or 'pick' to select one interactively. Forces offline mode for the run; never persisted."
+    )]
+    date: Option<String>,
+
+    #[arg(
         long = "disable-source",
         value_enum,
         action = ArgAction::Append,
@@ -783,6 +790,7 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
         log_file,
         log_file_max_bytes,
         disabled_sources,
+        date_override: None,
     };
     set_log_file(settings.log_file.clone(), settings.log_file_max_bytes);
 
@@ -829,13 +837,14 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
             return dispatch_info(&cache, &settings);
         }
         Some(CommandArg::Choose) => {
-            return dispatch_choose(
+            return dispatch_choose_maybe_dated(
                 &client,
                 &cache,
                 &favorites,
                 &registry,
                 &settings,
                 &source_settings,
+                args.date.as_deref(),
             );
         }
         Some(CommandArg::Reapply) => {
@@ -853,6 +862,7 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
                             &registry,
                             &settings,
                             &source_settings,
+                            args.date.as_deref(),
                         );
                     }
                     Err(InquireError::OperationCanceled) => {
@@ -892,22 +902,117 @@ fn dispatch_reapply(cache: &CacheManager, settings: &Settings) -> Result<()> {
     reapply_last_wallpaper(cache, settings)
 }
 
+fn validate_date_arg(cache: &CacheManager, value: &str) -> Result<NaiveDate> {
+    let date = NaiveDate::parse_from_str(value, "%Y-%m-%d").map_err(|_| {
+        WallpaperError::Message(format!(
+            "Invalid date '{value}'. Expected YYYY-MM-DD, or use --date pick to select from cached dates."
+        ))
+    })?;
+    let today = Local::now().date_naive();
+    if date > today {
+        return Err(WallpaperError::Message(format!(
+            "{date} is in the future; cache only holds past days."
+        )));
+    }
+    let available = list_cached_dates(cache, false);
+    if available.contains(&date) {
+        return Ok(date);
+    }
+    if available.is_empty() {
+        return Err(WallpaperError::Message(
+            "No cached wallpapers found for any date yet.".to_string(),
+        ));
+    }
+    let list = available
+        .iter()
+        .map(|d| d.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(WallpaperError::Message(format!(
+        "No cached wallpapers found for {date}. Cached dates available: {list}. Use --date pick to select interactively."
+    )))
+}
+
+fn pick_cached_date(cache: &CacheManager) -> Result<Option<NaiveDate>> {
+    let dates = list_cached_dates(cache, true);
+    if dates.is_empty() {
+        println!("No cached dates found yet.");
+        return Ok(None);
+    }
+    let labels: Vec<String> = dates.iter().map(|d| d.to_string()).collect();
+    match Select::new("Select a cached date", labels).prompt() {
+        Ok(label) => Ok(NaiveDate::parse_from_str(&label, "%Y-%m-%d").ok()),
+        Err(_) => Ok(None),
+    }
+}
+
+fn settings_with_date_override(settings: &Settings, date: NaiveDate) -> Settings {
+    let mut dated = settings.clone();
+    if !dated.offline {
+        log(
+            &format!("Offline mode forced because --date {date} was used."),
+            dated.quiet,
+        );
+    }
+    dated.offline = true;
+    dated.date_override = Some(date);
+    dated
+}
+
+fn dispatch_choose_maybe_dated(
+    client: &Client,
+    cache: &CacheManager,
+    favorites: &FavoritesManager,
+    registry: &SourceRegistry,
+    settings: &Settings,
+    source_settings: &SourceSettings,
+    date_arg: Option<&str>,
+) -> Result<()> {
+    let Some(date_arg) = date_arg else {
+        return dispatch_choose(client, cache, favorites, registry, settings, source_settings);
+    };
+    let chosen = if date_arg.eq_ignore_ascii_case("pick") {
+        pick_cached_date(cache)?
+    } else {
+        Some(validate_date_arg(cache, date_arg)?)
+    };
+    let Some(date) = chosen else {
+        return Ok(());
+    };
+    let dated_settings = settings_with_date_override(settings, date);
+    dispatch_choose(
+        client,
+        cache,
+        favorites,
+        registry,
+        &dated_settings,
+        source_settings,
+    )
+}
+
 enum ParentMenuChoice {
     Choose,
     Info,
     Reapply,
+    BrowseCache,
 }
 
 fn prompt_parent_menu() -> std::result::Result<ParentMenuChoice, InquireError> {
     const CHOOSE: &str = "Choose a wallpaper";
     const INFO: &str = "Show info about the current wallpaper";
     const REAPPLY: &str = "Reapply the last wallpaper";
+    const BROWSE_CACHE: &str = "Browse cache";
 
-    let selection = Select::new("What would you like to do?", vec![CHOOSE, INFO, REAPPLY]).prompt()?;
+    let selection = Select::new(
+        "What would you like to do?",
+        vec![CHOOSE, INFO, REAPPLY, BROWSE_CACHE],
+    )
+    .prompt()?;
     Ok(match selection {
         CHOOSE => ParentMenuChoice::Choose,
         INFO => ParentMenuChoice::Info,
         REAPPLY => ParentMenuChoice::Reapply,
+        BROWSE_CACHE => ParentMenuChoice::BrowseCache,
         _ => unreachable!("inquire only returns one of the provided options"),
     })
 }
@@ -920,13 +1025,29 @@ fn run_menu_selection(
     registry: &SourceRegistry,
     settings: &Settings,
     source_settings: &SourceSettings,
+    date_arg: Option<&str>,
 ) -> Result<()> {
     match choice {
-        ParentMenuChoice::Choose => {
-            dispatch_choose(client, cache, favorites, registry, settings, source_settings)
-        }
+        ParentMenuChoice::Choose => dispatch_choose_maybe_dated(
+            client,
+            cache,
+            favorites,
+            registry,
+            settings,
+            source_settings,
+            date_arg,
+        ),
         ParentMenuChoice::Info => dispatch_info(cache, settings),
         ParentMenuChoice::Reapply => dispatch_reapply(cache, settings),
+        ParentMenuChoice::BrowseCache => dispatch_choose_maybe_dated(
+            client,
+            cache,
+            favorites,
+            registry,
+            settings,
+            source_settings,
+            Some("pick"),
+        ),
     }
 }
 
@@ -1253,9 +1374,12 @@ fn target_date_for_day(day: i32) -> NaiveDate {
 
 fn date_label_for(
     source: Option<&dyn Source>,
-    _settings: &Settings,
+    settings: &Settings,
     source_settings: &SourceSettings,
 ) -> String {
+    if let Some(date) = settings.date_override {
+        return date.to_string();
+    }
     let use_day = source.map(|s| s.supports_day()).unwrap_or(true);
     let target_date = if use_day {
         target_date_for_day(source_settings.bing.day)
@@ -2082,6 +2206,41 @@ fn prune_cache(cache: &CacheManager, keep_days: u32, quiet: bool) -> Result<()> 
     Ok(())
 }
 
+fn list_cached_dates(cache: &CacheManager, exclude_today: bool) -> Vec<NaiveDate> {
+    let today = Local::now().date_naive();
+    let mut dates = Vec::new();
+    let Ok(entries) = fs::read_dir(&cache.base_dir) else {
+        return dates;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let Ok(date) = NaiveDate::parse_from_str(name, "%Y-%m-%d") else {
+            continue;
+        };
+        if exclude_today && date == today {
+            continue;
+        }
+        let has_candidates = cache
+            .load_index(name)
+            .ok()
+            .flatten()
+            .map(|index| !index.candidates.is_empty())
+            .unwrap_or(false);
+        if !has_candidates {
+            continue;
+        }
+        dates.push(date);
+    }
+    dates.sort_by(|a, b| b.cmp(a));
+    dates
+}
+
 fn apply_wallpaper(
     file_path: &Path,
     settings: &Settings,
@@ -2705,6 +2864,7 @@ mod tests {
             log_file: None,
             log_file_max_bytes: 5120 * 1024,
             disabled_sources: HashSet::new(),
+            date_override: None,
         }
     }
 
@@ -3714,6 +3874,7 @@ mod tests {
             &SourceRegistry::new(),
             &settings,
             &SourceSettings::from_config(None).unwrap(),
+            None,
         );
         let via_dispatch = dispatch_info(&cache, &settings);
 
@@ -3736,6 +3897,7 @@ mod tests {
             &SourceRegistry::new(),
             &settings,
             &SourceSettings::from_config(None).unwrap(),
+            None,
         );
         let via_dispatch = dispatch_reapply(&cache, &settings);
 
@@ -3756,5 +3918,206 @@ mod tests {
         assert!(matches!(cli.command, Some(CommandArg::AutoUpdateRun)));
         let cli = Cli::parse_from(["daily-wallpaper"]);
         assert!(cli.command.is_none());
+    }
+
+    fn insert_dummy_candidate(cache: &CacheManager, date: &str, source: WallpaperSource) {
+        let candidate = WallpaperCandidate {
+            id: format!("{source:?}-{date}"),
+            source,
+            title: None,
+            description: None,
+            attribution: None,
+            info_url: None,
+            image_url: "https://example.com/image.jpg".into(),
+            local_path: PathBuf::from(format!("/tmp/{source:?}-{date}.jpg")),
+            date: date.to_string(),
+            metadata_xml: None,
+            checksum: None,
+        };
+        cache.upsert_candidate(date, candidate).unwrap();
+    }
+
+    #[test]
+    fn cli_parses_date_flag_direct_and_pick() {
+        let cli = Cli::parse_from(["daily-wallpaper", "choose", "--date", "2026-08-10"]);
+        assert_eq!(cli.date.as_deref(), Some("2026-08-10"));
+        let cli = Cli::parse_from(["daily-wallpaper", "choose", "--date", "pick"]);
+        assert_eq!(cli.date.as_deref(), Some("pick"));
+        let cli = Cli::parse_from(["daily-wallpaper", "choose"]);
+        assert_eq!(cli.date, None);
+    }
+
+    #[test]
+    fn list_cached_dates_ignores_non_date_and_empty_folders() {
+        let tmpdir = tempdir().unwrap();
+        let cache = CacheManager::new(tmpdir.path());
+        let today = Local::now().date_naive();
+        let with_candidate = (today - ChronoDuration::days(2)).to_string();
+        let empty_index = (today - ChronoDuration::days(3)).to_string();
+
+        insert_dummy_candidate(&cache, &with_candidate, WallpaperSource::Bing);
+        fs::create_dir_all(cache.base_dir.join(&empty_index)).unwrap();
+        fs::create_dir_all(cache.base_dir.join("not-a-date")).unwrap();
+
+        let dates = list_cached_dates(&cache, false);
+        assert_eq!(dates, vec![NaiveDate::parse_from_str(&with_candidate, "%Y-%m-%d").unwrap()]);
+    }
+
+    #[test]
+    fn list_cached_dates_sorts_descending_and_can_exclude_today() {
+        let tmpdir = tempdir().unwrap();
+        let cache = CacheManager::new(tmpdir.path());
+        let today = Local::now().date_naive();
+        let yesterday = today - ChronoDuration::days(1);
+        let two_days_ago = today - ChronoDuration::days(2);
+
+        insert_dummy_candidate(&cache, &today.to_string(), WallpaperSource::Bing);
+        insert_dummy_candidate(&cache, &yesterday.to_string(), WallpaperSource::Bing);
+        insert_dummy_candidate(&cache, &two_days_ago.to_string(), WallpaperSource::Bing);
+
+        let including_today = list_cached_dates(&cache, false);
+        assert_eq!(including_today, vec![today, yesterday, two_days_ago]);
+
+        let excluding_today = list_cached_dates(&cache, true);
+        assert_eq!(excluding_today, vec![yesterday, two_days_ago]);
+    }
+
+    #[test]
+    fn validate_date_arg_rejects_malformed_date() {
+        let tmpdir = tempdir().unwrap();
+        let cache = CacheManager::new(tmpdir.path());
+        let err = validate_date_arg(&cache, "2026-13-40").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Invalid date '2026-13-40'. Expected YYYY-MM-DD, or use --date pick to select from cached dates."
+        );
+    }
+
+    #[test]
+    fn validate_date_arg_rejects_future_date() {
+        let tmpdir = tempdir().unwrap();
+        let cache = CacheManager::new(tmpdir.path());
+        let future = (Local::now().date_naive() + ChronoDuration::days(1)).to_string();
+        let err = validate_date_arg(&cache, &future).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("{future} is in the future; cache only holds past days.")
+        );
+    }
+
+    #[test]
+    fn validate_date_arg_errors_when_nothing_cached_lists_available_dates() {
+        let tmpdir = tempdir().unwrap();
+        let cache = CacheManager::new(tmpdir.path());
+        let today = Local::now().date_naive();
+        let cached = today - ChronoDuration::days(1);
+        let requested = today - ChronoDuration::days(2);
+        insert_dummy_candidate(&cache, &cached.to_string(), WallpaperSource::Bing);
+
+        let err = validate_date_arg(&cache, &requested.to_string()).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "No cached wallpapers found for {requested}. Cached dates available: {cached}. Use --date pick to select interactively."
+            )
+        );
+    }
+
+    #[test]
+    fn validate_date_arg_errors_plainly_when_cache_entirely_empty() {
+        let tmpdir = tempdir().unwrap();
+        let cache = CacheManager::new(tmpdir.path());
+        let requested = (Local::now().date_naive() - ChronoDuration::days(1)).to_string();
+
+        let err = validate_date_arg(&cache, &requested).unwrap_err();
+        assert_eq!(err.to_string(), "No cached wallpapers found for any date yet.");
+    }
+
+    #[test]
+    fn validate_date_arg_accepts_cached_past_date() {
+        let tmpdir = tempdir().unwrap();
+        let cache = CacheManager::new(tmpdir.path());
+        let cached = Local::now().date_naive() - ChronoDuration::days(1);
+        insert_dummy_candidate(&cache, &cached.to_string(), WallpaperSource::Bing);
+
+        assert_eq!(validate_date_arg(&cache, &cached.to_string()).unwrap(), cached);
+    }
+
+    #[test]
+    fn date_override_bypasses_today_and_day_offset() {
+        let tmpdir = tempdir().unwrap();
+        let mut settings = make_settings(tmpdir.path(), None, false);
+        let source_settings = SourceSettings::from_config(None).unwrap();
+        let override_date = NaiveDate::parse_from_str("2020-01-15", "%Y-%m-%d").unwrap();
+        settings.date_override = Some(override_date);
+
+        assert_eq!(
+            date_label_for(None, &settings, &source_settings),
+            "2020-01-15"
+        );
+    }
+
+    #[test]
+    fn settings_with_date_override_forces_offline_and_sets_date() {
+        let tmpdir = tempdir().unwrap();
+        let settings = make_settings(tmpdir.path(), None, false);
+        assert!(!settings.offline);
+        let date = Local::now().date_naive() - ChronoDuration::days(1);
+
+        let dated = settings_with_date_override(&settings, date);
+        assert!(dated.offline);
+        assert_eq!(dated.date_override, Some(date));
+    }
+
+    #[test]
+    fn run_menu_selection_browse_cache_with_empty_cache_returns_ok_without_prompting() {
+        let tmpdir = tempdir().unwrap();
+        let cache = CacheManager::new(tmpdir.path());
+        let settings = make_settings(tmpdir.path(), None, false);
+
+        let result = run_menu_selection(
+            ParentMenuChoice::BrowseCache,
+            &build_client().unwrap(),
+            &cache,
+            &FavoritesManager::new(tmpdir.path().join("favorites")),
+            &SourceRegistry::new(),
+            &settings,
+            &SourceSettings::from_config(None).unwrap(),
+            None,
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn dispatch_choose_maybe_dated_without_date_arg_matches_plain_dispatch_choose() {
+        let tmpdir = tempdir().unwrap();
+        let cache = CacheManager::new(tmpdir.path());
+        let favorites = FavoritesManager::new(tmpdir.path().join("favorites"));
+        let mut settings = make_settings(tmpdir.path(), None, false);
+        settings.offline = true;
+
+        let via_helper = dispatch_choose_maybe_dated(
+            &build_client().unwrap(),
+            &cache,
+            &favorites,
+            &SourceRegistry::new(),
+            &settings,
+            &SourceSettings::from_config(None).unwrap(),
+            None,
+        );
+        let via_dispatch = dispatch_choose(
+            &build_client().unwrap(),
+            &cache,
+            &favorites,
+            &SourceRegistry::new(),
+            &settings,
+            &SourceSettings::from_config(None).unwrap(),
+        );
+
+        assert_eq!(
+            via_helper.is_err(),
+            via_dispatch.is_err()
+        );
     }
 }
