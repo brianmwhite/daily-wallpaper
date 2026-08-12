@@ -845,30 +845,36 @@ fn run_with_raw_args(raw_args: Vec<String>) -> Result<()> {
                 &settings,
                 &source_settings,
                 args.date.as_deref(),
-            );
+            )
+            .map(|_outcome| ());
         }
         Some(CommandArg::Reapply) => {
             return dispatch_reapply(&cache, &settings);
         }
         None => {
             if io::stdin().is_terminal() && io::stdout().is_terminal() {
-                match prompt_parent_menu() {
-                    Ok(choice) => {
-                        return run_menu_selection(
-                            choice,
-                            &client,
-                            &cache,
-                            &favorites,
-                            &registry,
-                            &settings,
-                            &source_settings,
-                            args.date.as_deref(),
-                        );
+                loop {
+                    match prompt_parent_menu() {
+                        Ok(choice) => {
+                            match run_menu_selection(
+                                choice,
+                                &client,
+                                &cache,
+                                &favorites,
+                                &registry,
+                                &settings,
+                                &source_settings,
+                                args.date.as_deref(),
+                            )? {
+                                ChooseOutcome::Canceled => continue,
+                                ChooseOutcome::Done => return Ok(()),
+                            }
+                        }
+                        Err(InquireError::OperationCanceled) => {
+                            return Ok(());
+                        }
+                        Err(_) => break,
                     }
-                    Err(InquireError::OperationCanceled) => {
-                        return Ok(());
-                    }
-                    Err(_) => {}
                 }
             }
         }
@@ -884,6 +890,17 @@ fn dispatch_info(cache: &CacheManager, settings: &Settings) -> Result<()> {
     show_info(cache, settings, &mut handle)
 }
 
+/// Outcome of a Choose/Browse-cache flow, distinguishing a completed flow
+/// (applied, quit, or errored out) from one the user backed out of via
+/// Escape or "Quit chooser" at its outermost prompt. Callers reached
+/// directly via a subcommand collapse both to a plain exit; callers reached
+/// via the parent menu use `Canceled` to loop back to it.
+#[derive(Debug, PartialEq, Eq)]
+enum ChooseOutcome {
+    Done,
+    Canceled,
+}
+
 fn dispatch_choose(
     client: &Client,
     cache: &CacheManager,
@@ -891,7 +908,7 @@ fn dispatch_choose(
     registry: &SourceRegistry,
     settings: &Settings,
     source_settings: &SourceSettings,
-) -> Result<()> {
+) -> Result<ChooseOutcome> {
     ensure_picture_dir(&settings.picture_dir)?;
     ensure_picture_dir(&settings.favorites_dir)?;
     run_choose(client, cache, favorites, registry, settings, source_settings)
@@ -933,16 +950,29 @@ fn validate_date_arg(cache: &CacheManager, value: &str) -> Result<NaiveDate> {
     )))
 }
 
-fn pick_cached_date(cache: &CacheManager) -> Result<Option<NaiveDate>> {
+enum PickedDate {
+    Selected(NaiveDate),
+    /// User pressed Escape at the date list.
+    Canceled,
+    /// Nothing to pick from, or the prompt failed for a reason other than
+    /// cancellation; either way there's no date to proceed with.
+    Unavailable,
+}
+
+fn pick_cached_date(cache: &CacheManager) -> Result<PickedDate> {
     let dates = list_cached_dates(cache, true);
     if dates.is_empty() {
         println!("No cached dates found yet.");
-        return Ok(None);
+        return Ok(PickedDate::Unavailable);
     }
     let labels: Vec<String> = dates.iter().map(|d| d.to_string()).collect();
     match Select::new("Select a cached date", labels).prompt() {
-        Ok(label) => Ok(NaiveDate::parse_from_str(&label, "%Y-%m-%d").ok()),
-        Err(_) => Ok(None),
+        Ok(label) => match NaiveDate::parse_from_str(&label, "%Y-%m-%d") {
+            Ok(date) => Ok(PickedDate::Selected(date)),
+            Err(_) => Ok(PickedDate::Unavailable),
+        },
+        Err(InquireError::OperationCanceled) => Ok(PickedDate::Canceled),
+        Err(_) => Ok(PickedDate::Unavailable),
     }
 }
 
@@ -967,27 +997,44 @@ fn dispatch_choose_maybe_dated(
     settings: &Settings,
     source_settings: &SourceSettings,
     date_arg: Option<&str>,
-) -> Result<()> {
+) -> Result<ChooseOutcome> {
     let Some(date_arg) = date_arg else {
         return dispatch_choose(client, cache, favorites, registry, settings, source_settings);
     };
-    let chosen = if date_arg.eq_ignore_ascii_case("pick") {
-        pick_cached_date(cache)?
-    } else {
-        Some(validate_date_arg(cache, date_arg)?)
-    };
-    let Some(date) = chosen else {
-        return Ok(());
-    };
-    let dated_settings = settings_with_date_override(settings, date);
-    dispatch_choose(
-        client,
-        cache,
-        favorites,
-        registry,
-        &dated_settings,
-        source_settings,
-    )
+    if !date_arg.eq_ignore_ascii_case("pick") {
+        let date = validate_date_arg(cache, date_arg)?;
+        let dated_settings = settings_with_date_override(settings, date);
+        return dispatch_choose(
+            client,
+            cache,
+            favorites,
+            registry,
+            &dated_settings,
+            source_settings,
+        );
+    }
+    // Canceling the wallpaper list after a date has been picked backs out to
+    // the date list, not past it — only canceling the date list itself
+    // (nothing picked yet) bubbles `Canceled` up to our caller.
+    loop {
+        let date = match pick_cached_date(cache)? {
+            PickedDate::Selected(date) => date,
+            PickedDate::Canceled => return Ok(ChooseOutcome::Canceled),
+            PickedDate::Unavailable => return Ok(ChooseOutcome::Done),
+        };
+        let dated_settings = settings_with_date_override(settings, date);
+        match dispatch_choose(
+            client,
+            cache,
+            favorites,
+            registry,
+            &dated_settings,
+            source_settings,
+        )? {
+            ChooseOutcome::Canceled => continue,
+            ChooseOutcome::Done => return Ok(ChooseOutcome::Done),
+        }
+    }
 }
 
 enum ParentMenuChoice {
@@ -1026,7 +1073,7 @@ fn run_menu_selection(
     settings: &Settings,
     source_settings: &SourceSettings,
     date_arg: Option<&str>,
-) -> Result<()> {
+) -> Result<ChooseOutcome> {
     match choice {
         ParentMenuChoice::Choose => dispatch_choose_maybe_dated(
             client,
@@ -1037,8 +1084,10 @@ fn run_menu_selection(
             source_settings,
             date_arg,
         ),
-        ParentMenuChoice::Info => dispatch_info(cache, settings),
-        ParentMenuChoice::Reapply => dispatch_reapply(cache, settings),
+        ParentMenuChoice::Info => dispatch_info(cache, settings).map(|()| ChooseOutcome::Done),
+        ParentMenuChoice::Reapply => {
+            dispatch_reapply(cache, settings).map(|()| ChooseOutcome::Done)
+        }
         ParentMenuChoice::BrowseCache => dispatch_choose_maybe_dated(
             client,
             cache,
@@ -1467,6 +1516,48 @@ fn filter_candidates_by_min_resolution(
     Ok(filtered)
 }
 
+type ChooseCancelState = Mutex<Option<(CancelFlag, Arc<AtomicBool>)>>;
+
+fn choose_cancel_state() -> &'static ChooseCancelState {
+    static STATE: OnceLock<ChooseCancelState> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(None))
+}
+
+/// Installs the Ctrl-C handler exactly once per process. `run_choose` can be
+/// entered more than once per process (the parent menu can loop back into
+/// it), but `ctrlc::set_handler` only permits a single installation — so the
+/// handler here reads the *current* cancel/fetch-active pair through
+/// `choose_cancel_state()` rather than closing over one from a specific
+/// `run_choose` call.
+fn ensure_choose_ctrlc_handler(quiet: bool) {
+    static INSTALLED: OnceLock<()> = OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        let result = ctrlc::set_handler(|| {
+            let live = choose_cancel_state().lock().unwrap().clone();
+            match live {
+                Some((cancel, fetch_active)) if fetch_active.load(Ordering::SeqCst) => {
+                    cancel.set();
+                }
+                _ => std::process::exit(130),
+            }
+        });
+        if let Err(err) = result {
+            log(&format!("Unable to install Ctrl-C handler: {err}"), quiet);
+        }
+    });
+}
+
+/// Clears the active Choose cancellation state on drop, so a stale
+/// `cancel`/`fetch_active` pair from a finished `run_choose` invocation is
+/// never mistaken for a live one by the process-wide Ctrl-C handler.
+struct ChooseCancelGuard;
+
+impl Drop for ChooseCancelGuard {
+    fn drop(&mut self) {
+        *choose_cancel_state().lock().unwrap() = None;
+    }
+}
+
 fn run_choose(
     client: &Client,
     cache: &CacheManager,
@@ -1474,7 +1565,7 @@ fn run_choose(
     registry: &SourceRegistry,
     settings: &Settings,
     source_settings: &SourceSettings,
-) -> Result<()> {
+) -> Result<ChooseOutcome> {
     let mut current_settings = settings.clone();
     let mut selected_idx: Option<usize> = None;
     let mut candidates_cache: Vec<WallpaperCandidate> = Vec::new();
@@ -1482,22 +1573,9 @@ fn run_choose(
     current_settings.refresh_metadata = false;
     let cancel = CancelFlag::new();
     let fetch_active = Arc::new(AtomicBool::new(false));
-    if let Err(err) = ctrlc::set_handler({
-        let cancel = cancel.clone();
-        let fetch_active = fetch_active.clone();
-        move || {
-            if fetch_active.load(Ordering::SeqCst) {
-                cancel.set();
-            } else {
-                std::process::exit(130);
-            }
-        }
-    }) {
-        log(
-            &format!("Unable to install Ctrl-C handler: {err}"),
-            settings.quiet,
-        );
-    }
+    ensure_choose_ctrlc_handler(settings.quiet);
+    *choose_cancel_state().lock().unwrap() = Some((cancel.clone(), fetch_active.clone()));
+    let _cancel_guard = ChooseCancelGuard;
 
     let normalize_label = |value: &str| {
         value
@@ -1594,7 +1672,8 @@ fn run_choose(
                 let pos = labels.iter().position(|l| l == &label).unwrap_or(0);
                 (pos, label)
             }
-            Err(_) => return Ok(()),
+            Err(InquireError::OperationCanceled) => return Ok(ChooseOutcome::Canceled),
+            Err(_) => return Ok(ChooseOutcome::Done),
         };
         selected_idx = Some(idx.min(labels.len().saturating_sub(1)));
 
@@ -1651,7 +1730,7 @@ fn run_choose(
                             Some(&cand.date),
                             true,
                         ) {
-                            Ok(()) => return Ok(()),
+                            Ok(()) => return Ok(ChooseOutcome::Done),
                             Err(err) => println!("Failed to apply wallpaper: {err}"),
                         }
                     }
@@ -1676,9 +1755,11 @@ fn run_choose(
                         candidates_dirty = true;
                         break;
                     }
-                    Ok(choice) if choice.starts_with("Quit") => return Ok(()),
+                    Ok(choice) if choice.starts_with("Quit") => {
+                        return Ok(ChooseOutcome::Canceled)
+                    }
                     Err(InquireError::OperationCanceled) => break,
-                    _ => return Ok(()),
+                    _ => return Ok(ChooseOutcome::Done),
                 }
             }
         }
@@ -4086,7 +4167,54 @@ mod tests {
             None,
         );
 
-        assert!(result.is_ok());
+        assert!(matches!(result, Ok(ChooseOutcome::Done)));
+    }
+
+    #[test]
+    fn pick_cached_date_with_empty_cache_returns_unavailable() {
+        let tmpdir = tempdir().unwrap();
+        let cache = CacheManager::new(tmpdir.path());
+
+        let result = pick_cached_date(&cache);
+
+        assert!(matches!(result, Ok(PickedDate::Unavailable)));
+    }
+
+    #[test]
+    fn run_choose_reentry_clears_cancel_state_between_invocations() {
+        // All sources disabled means `run_choose` errors out before ever
+        // reaching an interactive prompt, so this is safe to call twice in
+        // one test process. It guards against the ctrlc re-entrancy bug fixed
+        // alongside the parent-menu loop: calling `run_choose` a second time
+        // in the same process must not panic, and the shared cancel-state
+        // cell must not leak a stale entry from the first invocation into
+        // (or past) the second.
+        let tmpdir = tempdir().unwrap();
+        let cache = CacheManager::new(tmpdir.path());
+        let favorites = FavoritesManager::new(tmpdir.path().join("favorites"));
+        let registry = SourceRegistry::new();
+        let client = build_client().unwrap();
+        let mut settings = make_settings(tmpdir.path(), None, false);
+        settings.disabled_sources = HashSet::from([
+            WallpaperSource::Bing,
+            WallpaperSource::Spotlight,
+            WallpaperSource::Apod,
+            WallpaperSource::Modis,
+        ]);
+        let source_settings = SourceSettings::from_config(None).unwrap();
+
+        for _ in 0..2 {
+            let result = run_choose(
+                &client,
+                &cache,
+                &favorites,
+                &registry,
+                &settings,
+                &source_settings,
+            );
+            assert!(result.is_err());
+            assert!(choose_cancel_state().lock().unwrap().is_none());
+        }
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "daily-wallpaper"
-version = "2.7.2"
+version = "2.8.0"
 edition = "2021"
 description = "Download various daily wallpaper options to set it across macOS desktops and monitors."
 license = "GPL-3.0-or-later"
